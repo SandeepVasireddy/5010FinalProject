@@ -6,6 +6,7 @@ venv/
 
 # Ignore other unnecessary files
 *.pyc
+*.py[cod]
 __pycache__/
 .DS_Store
 5010FinalProject/
