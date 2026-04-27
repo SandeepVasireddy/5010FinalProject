@@ -30,5 +30,10 @@ jobs:
       run: |
         pytest
 
+    - name: Use Node.js 24
+      uses: actions/setup-node@v3
+      with:
+        node-version: '24'
+
 env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
