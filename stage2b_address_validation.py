@@ -1,0 +1,811 @@
+"""
+MDM Pipeline — Stage 2B: Address Validation & Correction Engine
+Week 2 Deliverable
+
+This module implements:
+1. Address Validation API integration (Google Address Validation API)
+   - With simulation/mock mode for development without API keys
+2. Validation result parsing and diagnostic extraction
+3. Address correction logic (auto-fix using API suggestions)
+4. Retry/escalation flow for failed corrections
+5. Validation reporting with per-record diagnostics
+
+Architecture:
+  Stage 1 output → Enhanced Preprocessing (2A) → Validation API (2B)
+    ├─ VALIDATED → pass to Stage 3 (company verification)
+    ├─ CORRECTED → auto-corrected, re-validated, pass to Stage 3
+    └─ FAILED → flagged with diagnostics for manual review
+"""
+
+import pandas as pd
+import numpy as np
+import re
+import json
+import time
+import hashlib
+import asyncio
+import aiohttp
+from typing import Optional
+from pathlib import Path
+from datetime import datetime
+
+# ──────────────────────────────────────────────
+# 1. GOOGLE ADDRESS VALIDATION API CLIENT
+# ──────────────────────────────────────────────
+
+class AddressValidationClient:
+    """
+    Client for Google Address Validation API.
+    Falls back to simulation mode when API key is not available.
+    """
+
+    GOOGLE_API_URL = "https://addressvalidation.googleapis.com/v1:validateAddress"
+
+    def __init__(self, api_key: Optional[str] = None, use_simulation: bool = True):
+        self.api_key = api_key
+        self.use_simulation = use_simulation if not api_key else False
+        self.call_count = 0
+        self.rate_limit_delay = 0.1  # seconds between API calls
+
+        if self.use_simulation:
+            print("[AddressValidation] Running in SIMULATION mode (no API key)")
+        else:
+            print(f"[AddressValidation] Using Google Address Validation API")
+
+    async def validate_address(self, address: str, country: str,
+                               session: Optional[aiohttp.ClientSession] = None) -> dict:
+        """Validate a single address. Returns structured result."""
+        self.call_count += 1
+
+        if self.use_simulation:
+            return self._simulate_validation(address, country)
+
+        return await self._call_google_api(address, country, session)
+
+    async def _call_google_api(self, address: str, country: str,
+                               session: aiohttp.ClientSession) -> dict:
+        """Call the actual Google Address Validation API."""
+        payload = {
+            "address": {
+                "addressLines": [address],
+                "regionCode": country,
+            },
+            "enableUspsCass": country == "US",
+        }
+
+        try:
+            await asyncio.sleep(self.rate_limit_delay)
+            async with session.post(
+                f"{self.GOOGLE_API_URL}?key={self.api_key}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return self._parse_google_response(data, address)
+                else:
+                    error_text = await resp.text()
+                    return {
+                        "validation_status": "API_ERROR",
+                        "api_error": f"HTTP {resp.status}: {error_text[:200]}",
+                        "original_address": address,
+                    }
+        except asyncio.TimeoutError:
+            return {
+                "validation_status": "API_ERROR",
+                "api_error": "Request timeout",
+                "original_address": address,
+            }
+        except Exception as e:
+            return {
+                "validation_status": "API_ERROR",
+                "api_error": str(e)[:200],
+                "original_address": address,
+            }
+
+    def _parse_google_response(self, data: dict, original: str) -> dict:
+        """Parse Google Address Validation API response into standardized format."""
+        result = data.get("result", {})
+        verdict = result.get("verdict", {})
+        address = result.get("address", {})
+        geocode = result.get("geocode", {})
+
+        # Extract components
+        formatted = address.get("formattedAddress", "")
+        components = {}
+        for comp in address.get("addressComponents", []):
+            comp_type = comp.get("componentType", "")
+            components[comp_type] = {
+                "value": comp.get("componentName", {}).get("text", ""),
+                "confirmed": comp.get("confirmationLevel", "") == "CONFIRMED",
+                "inferred": comp.get("inferred", False),
+                "replaced": comp.get("replaced", False),
+            }
+
+        # Extract location
+        location = geocode.get("location", {})
+        lat = location.get("latitude")
+        lng = location.get("longitude")
+
+        # Determine validation status
+        input_granularity = verdict.get("inputGranularity", "")
+        validation_granularity = verdict.get("validationGranularity", "")
+        has_unconfirmed = verdict.get("hasUnconfirmedComponents", False)
+        has_inferred = verdict.get("hasInferredComponents", False)
+        has_replaced = verdict.get("hasReplacedComponents", False)
+
+        if validation_granularity in ("PREMISE", "SUB_PREMISE") and not has_unconfirmed:
+            status = "VALIDATED"
+        elif has_replaced or has_inferred:
+            status = "CORRECTED"
+        elif validation_granularity in ("ROUTE", "BLOCK"):
+            status = "PARTIAL_MATCH"
+        else:
+            status = "FAILED"
+
+        # Build diagnostic
+        diagnostics = []
+        for comp_type, comp_data in components.items():
+            if comp_data.get("replaced"):
+                diagnostics.append(f"{comp_type}: replaced")
+            if comp_data.get("inferred"):
+                diagnostics.append(f"{comp_type}: inferred")
+            if not comp_data.get("confirmed"):
+                diagnostics.append(f"{comp_type}: unconfirmed")
+
+        return {
+            "validation_status": status,
+            "formatted_address": formatted,
+            "latitude": lat,
+            "longitude": lng,
+            "validation_granularity": validation_granularity,
+            "components": components,
+            "diagnostics": diagnostics,
+            "has_unconfirmed": has_unconfirmed,
+            "has_inferred": has_inferred,
+            "has_replaced": has_replaced,
+            "original_address": original,
+            "api_error": None,
+        }
+
+    def _simulate_validation(self, address: str, country: str) -> dict:
+        """
+        Simulate validation for development without API keys.
+        Uses deterministic heuristics based on address structure.
+        """
+        # Parse address components for heuristic validation
+        has_number = bool(re.search(r"\d", address))
+        has_street_word = bool(re.search(
+            r"\b(Street|Road|Avenue|Boulevard|Drive|Lane|Way|Place|Court|"
+            r"Calle|Avenida|Via|Rue|Straße|Rua|Corso|Viale|Piazza)\b",
+            address, re.IGNORECASE
+        ))
+        parts = [p.strip() for p in address.split(",") if p.strip()]
+        num_parts = len(parts)
+        addr_length = len(address)
+
+        # Use address hash for deterministic randomness
+        hash_val = int(hashlib.md5(address.encode()).hexdigest()[:8], 16)
+        hash_frac = (hash_val % 1000) / 1000.0
+
+        # Heuristic scoring
+        score = 0
+        if has_number:
+            score += 30
+        if has_street_word:
+            score += 25
+        if num_parts >= 3:
+            score += 20
+        if num_parts >= 4:
+            score += 10
+        if addr_length > 20:
+            score += 10
+        if country in ("US", "GB", "CA", "AU", "DE", "FR"):
+            score += 5
+
+        # Determine status based on score + some pseudo-random variation
+        diagnostics = []
+        corrections = {}
+
+        if score >= 70:
+            # Likely valid — simulate VALIDATED or minor CORRECTED
+            if hash_frac < 0.65:
+                status = "VALIDATED"
+            elif hash_frac < 0.90:
+                status = "CORRECTED"
+                # Simulate minor corrections
+                if not re.search(r"\d{5}", address) and country == "US":
+                    diagnostics.append("postal_code: inferred")
+                    corrections["postal_code_inferred"] = True
+                if hash_frac > 0.80:
+                    diagnostics.append("street_number: confirmed with correction")
+            else:
+                status = "PARTIAL_MATCH"
+                diagnostics.append("address: matched to route level only")
+        elif score >= 40:
+            # Partial match — higher failure rate
+            if hash_frac < 0.30:
+                status = "CORRECTED"
+                diagnostics.append("street: partially matched and corrected")
+                if not has_number:
+                    diagnostics.append("street_number: missing, inferred from context")
+            elif hash_frac < 0.60:
+                status = "PARTIAL_MATCH"
+                diagnostics.append("address: matched to route level only")
+                if not has_number:
+                    diagnostics.append("street_number: missing")
+            else:
+                status = "FAILED"
+                diagnostics.append("address: insufficient match confidence")
+                if not has_number:
+                    diagnostics.append("street_number: missing")
+                if not has_street_word:
+                    diagnostics.append("street_name: unrecognized format")
+        else:
+            # Low score — very likely failure
+            status = "FAILED"
+            if not has_number:
+                diagnostics.append("street_number: missing")
+            if not has_street_word:
+                diagnostics.append("street_name: unrecognized")
+            if num_parts < 3:
+                diagnostics.append("address: insufficient components")
+
+        # Generate simulated formatted address (slightly cleaned version)
+        formatted = address.strip()
+        if status in ("VALIDATED", "CORRECTED"):
+            # Title case city names, standardize country
+            formatted_parts = [p.strip() for p in formatted.split(",")]
+            if len(formatted_parts) >= 2:
+                formatted_parts[-1] = formatted_parts[-1].strip().upper()
+            formatted = ", ".join(formatted_parts)
+
+        # Simulated geocoordinates (deterministic from address hash)
+        lat_base = {
+            "US": 39.0, "CA": 45.0, "GB": 51.5, "DE": 51.0, "FR": 46.0,
+            "ES": 40.0, "IT": 42.0, "MX": 23.0, "CN": 35.0, "AU": -33.0,
+            "BR": -15.0, "PT": 39.0, "BE": 50.8, "NL": 52.3, "RU": 55.7,
+        }.get(country, 40.0)
+        lng_base = {
+            "US": -98.0, "CA": -75.0, "GB": -0.1, "DE": 10.0, "FR": 2.3,
+            "ES": -3.7, "IT": 12.5, "MX": -102.0, "CN": 105.0, "AU": 151.2,
+            "BR": -47.9, "PT": -8.0, "BE": 4.4, "NL": 4.9, "RU": 37.6,
+        }.get(country, 0.0)
+
+        lat = lat_base + (hash_frac - 0.5) * 5
+        lng = lng_base + ((hash_val % 100) / 100.0 - 0.5) * 10
+
+        return {
+            "validation_status": status,
+            "formatted_address": formatted if status != "FAILED" else "",
+            "latitude": round(lat, 6) if status != "FAILED" else None,
+            "longitude": round(lng, 6) if status != "FAILED" else None,
+            "validation_granularity": {
+                "VALIDATED": "PREMISE",
+                "CORRECTED": "PREMISE",
+                "PARTIAL_MATCH": "ROUTE",
+                "FAILED": "OTHER",
+            }[status],
+            "components": {},
+            "diagnostics": diagnostics,
+            "has_unconfirmed": status in ("PARTIAL_MATCH", "FAILED"),
+            "has_inferred": "inferred" in " ".join(diagnostics),
+            "has_replaced": status == "CORRECTED",
+            "original_address": address,
+            "api_error": None,
+            "simulated": True,
+        }
+
+
+# ──────────────────────────────────────────────
+# 2. ADDRESS CORRECTION ENGINE
+# ──────────────────────────────────────────────
+
+class AddressCorrectionEngine:
+    """
+    Attempts to correct addresses that fail validation.
+    Strategies:
+    1. Component-level fixes (zip code correction, city-state realignment)
+    2. Address simplification (remove suite/unit, reduce to core address)
+    3. Fallback geocode search (submit just city + country)
+    """
+
+    # Common corrections by diagnostic type
+    CORRECTION_STRATEGIES = [
+        "component_fix",      # Fix specific components flagged by API
+        "simplify_address",   # Remove noise (suite, apt, building info)
+        "broaden_search",     # Use just city + state + country
+    ]
+
+    def __init__(self, client: AddressValidationClient):
+        self.client = client
+        self.correction_count = 0
+        self.success_count = 0
+
+    async def attempt_correction(self, original_address: str, country: str,
+                                 validation_result: dict,
+                                 session: Optional[aiohttp.ClientSession] = None) -> dict:
+        """
+        Attempt to correct a failed/partial address.
+        Tries multiple strategies in order until one succeeds.
+        """
+        self.correction_count += 1
+        diagnostics = validation_result.get("diagnostics", [])
+
+        attempts = []
+
+        for strategy in self.CORRECTION_STRATEGIES:
+            corrected = self._apply_strategy(strategy, original_address, country, diagnostics)
+
+            if corrected and corrected != original_address:
+                # Re-validate the corrected address
+                result = await self.client.validate_address(corrected, country, session)
+                result["correction_strategy"] = strategy
+                result["correction_input"] = corrected
+                attempts.append(result)
+
+                if result["validation_status"] in ("VALIDATED", "CORRECTED"):
+                    self.success_count += 1
+                    return {
+                        "correction_status": "CORRECTED",
+                        "corrected_address": result.get("formatted_address", corrected),
+                        "correction_strategy": strategy,
+                        "correction_attempts": len(attempts),
+                        "validation_result": result,
+                        "all_attempts": attempts,
+                    }
+
+        # All strategies failed
+        return {
+            "correction_status": "FAILED",
+            "corrected_address": None,
+            "correction_strategy": None,
+            "correction_attempts": len(attempts),
+            "validation_result": validation_result,
+            "all_attempts": attempts,
+            "failure_reason": self._diagnose_failure(original_address, diagnostics),
+        }
+
+    def _apply_strategy(self, strategy: str, address: str,
+                        country: str, diagnostics: list) -> Optional[str]:
+        """Apply a specific correction strategy and return the modified address."""
+
+        if strategy == "component_fix":
+            corrected = address
+            # Fix: missing or wrong postal code → remove it, let API infer
+            if any("postal" in d for d in diagnostics):
+                # Strip postal code (last component if it looks like one)
+                parts = [p.strip() for p in corrected.split(",")]
+                if parts and re.match(r"^[\d\s-]{3,10}$", parts[-1]):
+                    corrected = ", ".join(parts[:-1])
+                elif parts and re.match(r"^[A-Z0-9\s]{3,10}$", parts[-1]):
+                    corrected = ", ".join(parts[:-1])
+
+            # Fix: street number issues → try with just street name
+            if any("street_number" in d for d in diagnostics):
+                # Remove leading numbers
+                corrected = re.sub(r"^\d+[-/]?\d*\s*", "", corrected)
+
+            return corrected if corrected != address else None
+
+        elif strategy == "simplify_address":
+            corrected = address
+            # Remove suite/apt/unit/floor info
+            corrected = re.sub(r",?\s*(Suite|Ste|Apt|Unit|Floor|Fl|Room|Rm|Bldg|Building)\.?\s*\S*",
+                             "", corrected, flags=re.IGNORECASE)
+            # Remove parenthetical info
+            corrected = re.sub(r"\s*\([^)]*\)", "", corrected)
+            # Remove "No." numbers that might be internal codes
+            corrected = re.sub(r"\s*No\.?\s*\d+", "", corrected)
+            corrected = corrected.strip().rstrip(",").strip()
+            return corrected if corrected != address else None
+
+        elif strategy == "broaden_search":
+            # Extract just city + state + country
+            parts = [p.strip() for p in address.split(",")]
+            if len(parts) >= 3:
+                # Take last 2-3 components (city, state, country)
+                broad = ", ".join(parts[-3:])
+                return broad if broad != address else None
+            elif len(parts) == 2:
+                return address  # Already broad enough
+            return None
+
+        return None
+
+    def _diagnose_failure(self, address: str, diagnostics: list) -> str:
+        """Generate human-readable failure diagnosis."""
+        reasons = []
+
+        if not re.search(r"\d", address):
+            reasons.append("No street number found in address")
+        if len(address.strip()) < 10:
+            reasons.append("Address too short to validate")
+        if any("unrecognized" in d for d in diagnostics):
+            reasons.append("Street name not recognized by validation service")
+        if any("insufficient" in d for d in diagnostics):
+            reasons.append("Too few address components for reliable matching")
+        if not reasons:
+            reasons.append("Address could not be matched to a known location after multiple correction attempts")
+
+        return "; ".join(reasons)
+
+
+# ──────────────────────────────────────────────
+# 3. VALIDATION PIPELINE ORCHESTRATOR
+# ──────────────────────────────────────────────
+
+class ValidationPipeline:
+    """
+    Orchestrates the full validation + correction flow:
+    1. Submit address to validation API
+    2. If VALIDATED/CORRECTED → done
+    3. If PARTIAL_MATCH/FAILED → attempt corrections
+    4. If still failed → flag for manual review with diagnostics
+    """
+
+    def __init__(self, api_key: Optional[str] = None, max_retries: int = 3):
+        self.client = AddressValidationClient(api_key=api_key)
+        self.corrector = AddressCorrectionEngine(self.client)
+        self.max_retries = max_retries
+        self.stats = {
+            "total": 0,
+            "validated": 0,
+            "corrected": 0,
+            "partial": 0,
+            "failed": 0,
+            "api_errors": 0,
+            "skipped": 0,
+        }
+
+    async def validate_batch(self, df: pd.DataFrame, batch_size: int = 10) -> pd.DataFrame:
+        """Validate all records in the DataFrame."""
+
+        print("=" * 60)
+        print("Stage 2B: Address Validation & Correction")
+        print("=" * 60)
+
+        # Initialize result columns
+        result_cols = [
+            "validation_status", "validated_address", "latitude", "longitude",
+            "validation_granularity", "validation_diagnostics",
+            "correction_status", "correction_strategy", "correction_attempts",
+            "failure_reason", "manual_review_flag", "validation_timestamp",
+        ]
+        for col in result_cols:
+            df[col] = None
+
+        # Process in batches
+        total = len(df)
+        connector = aiohttp.TCPConnector(limit=batch_size)
+
+        async with aiohttp.ClientSession(connector=connector) as session:
+            for start in range(0, total, batch_size):
+                end = min(start + batch_size, total)
+                batch_indices = df.index[start:end]
+
+                tasks = []
+                for idx in batch_indices:
+                    row = df.loc[idx]
+                    tasks.append(self._process_record(idx, row, session))
+
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for idx, result in zip(batch_indices, results):
+                    if isinstance(result, Exception):
+                        df.at[idx, "validation_status"] = "API_ERROR"
+                        df.at[idx, "failure_reason"] = str(result)[:200]
+                        df.at[idx, "manual_review_flag"] = True
+                        self.stats["api_errors"] += 1
+                    else:
+                        for key, value in result.items():
+                            if key in result_cols:
+                                df.at[idx, key] = value
+
+                # Progress
+                processed = min(end, total)
+                print(f"  Processed {processed}/{total} records "
+                      f"(V:{self.stats['validated']} C:{self.stats['corrected']} "
+                      f"F:{self.stats['failed']} S:{self.stats['skipped']})")
+
+        self._print_summary(total)
+        return df
+
+    async def _process_record(self, idx: int, row: pd.Series,
+                              session: aiohttp.ClientSession) -> dict:
+        """Process a single record through validation + correction flow."""
+        self.stats["total"] += 1
+        timestamp = datetime.now().isoformat()
+
+        # Get the API-ready address
+        api_address = str(row.get("api_address", ""))
+        country = str(row.get("suggested_country", row.get("norm_country", "")))
+        completeness = str(row.get("completeness_class", ""))
+        quality_tier = str(row.get("quality_tier", ""))
+
+        # Skip records that can't be validated
+        if not api_address.strip() or completeness == "EMPTY":
+            self.stats["skipped"] += 1
+            return {
+                "validation_status": "SKIPPED",
+                "failure_reason": "No usable address for API submission",
+                "manual_review_flag": True,
+                "validation_timestamp": timestamp,
+            }
+
+        # Step 1: Initial validation
+        result = await self.client.validate_address(api_address, country, session)
+
+        if result.get("api_error"):
+            self.stats["api_errors"] += 1
+            return {
+                "validation_status": "API_ERROR",
+                "failure_reason": result["api_error"],
+                "manual_review_flag": True,
+                "validation_timestamp": timestamp,
+            }
+
+        status = result["validation_status"]
+
+        # Step 2: Handle results
+        if status == "VALIDATED":
+            self.stats["validated"] += 1
+            return {
+                "validation_status": "VALIDATED",
+                "validated_address": result.get("formatted_address", ""),
+                "latitude": result.get("latitude"),
+                "longitude": result.get("longitude"),
+                "validation_granularity": result.get("validation_granularity", ""),
+                "validation_diagnostics": json.dumps(result.get("diagnostics", [])),
+                "correction_status": None,
+                "correction_strategy": None,
+                "correction_attempts": 0,
+                "failure_reason": None,
+                "manual_review_flag": False,
+                "validation_timestamp": timestamp,
+            }
+
+        elif status == "CORRECTED":
+            self.stats["corrected"] += 1
+            return {
+                "validation_status": "CORRECTED",
+                "validated_address": result.get("formatted_address", ""),
+                "latitude": result.get("latitude"),
+                "longitude": result.get("longitude"),
+                "validation_granularity": result.get("validation_granularity", ""),
+                "validation_diagnostics": json.dumps(result.get("diagnostics", [])),
+                "correction_status": "API_CORRECTED",
+                "correction_strategy": "api_auto",
+                "correction_attempts": 1,
+                "failure_reason": None,
+                "manual_review_flag": False,
+                "validation_timestamp": timestamp,
+            }
+
+        else:
+            # Step 3: Attempt correction for PARTIAL_MATCH or FAILED
+            correction = await self.corrector.attempt_correction(
+                api_address, country, result, session
+            )
+
+            if correction["correction_status"] == "CORRECTED":
+                self.stats["corrected"] += 1
+                final_result = correction["validation_result"]
+                return {
+                    "validation_status": "CORRECTED",
+                    "validated_address": correction.get("corrected_address", ""),
+                    "latitude": final_result.get("latitude"),
+                    "longitude": final_result.get("longitude"),
+                    "validation_granularity": final_result.get("validation_granularity", ""),
+                    "validation_diagnostics": json.dumps(final_result.get("diagnostics", [])),
+                    "correction_status": "ENGINE_CORRECTED",
+                    "correction_strategy": correction.get("correction_strategy", ""),
+                    "correction_attempts": correction.get("correction_attempts", 0),
+                    "failure_reason": None,
+                    "manual_review_flag": False,
+                    "validation_timestamp": timestamp,
+                }
+            else:
+                self.stats["failed"] += 1
+                return {
+                    "validation_status": "FAILED",
+                    "validated_address": None,
+                    "latitude": None,
+                    "longitude": None,
+                    "validation_granularity": result.get("validation_granularity", ""),
+                    "validation_diagnostics": json.dumps(result.get("diagnostics", [])),
+                    "correction_status": "EXHAUSTED",
+                    "correction_strategy": None,
+                    "correction_attempts": correction.get("correction_attempts", 0),
+                    "failure_reason": correction.get("failure_reason", "Unknown"),
+                    "manual_review_flag": True,
+                    "validation_timestamp": timestamp,
+                }
+
+    def _print_summary(self, total: int):
+        """Print validation summary statistics."""
+        print(f"\n{'='*60}")
+        print("Validation Summary")
+        print(f"{'='*60}")
+        print(f"  Total processed:      {self.stats['total']}")
+        print(f"  Validated (clean):     {self.stats['validated']} "
+              f"({100*self.stats['validated']/max(total,1):.1f}%)")
+        print(f"  Corrected:             {self.stats['corrected']} "
+              f"({100*self.stats['corrected']/max(total,1):.1f}%)")
+        print(f"  Failed:                {self.stats['failed']} "
+              f"({100*self.stats['failed']/max(total,1):.1f}%)")
+        print(f"  Skipped:               {self.stats['skipped']} "
+              f"({100*self.stats['skipped']/max(total,1):.1f}%)")
+        print(f"  API errors:            {self.stats['api_errors']}")
+        print(f"  API calls made:        {self.client.call_count}")
+        print(f"  Correction attempts:   {self.corrector.correction_count}")
+        print(f"  Correction successes:  {self.corrector.success_count}")
+
+        success = self.stats['validated'] + self.stats['corrected']
+        print(f"\n  Overall success rate:  {success}/{total} "
+              f"({100*success/max(total,1):.1f}%)")
+        print(f"  Manual review queue:   {self.stats['failed'] + self.stats['skipped']} records")
+        print(f"{'='*60}")
+
+
+# ──────────────────────────────────────────────
+# 4. VALIDATION REPORT GENERATOR
+# ──────────────────────────────────────────────
+
+def generate_validation_report(df: pd.DataFrame, output_dir: str) -> dict:
+    """Generate comprehensive validation report."""
+    report = {
+        "generated_at": datetime.now().isoformat(),
+        "total_records": len(df),
+    }
+
+    # Validation status distribution
+    report["validation_distribution"] = (
+        df["validation_status"].value_counts().to_dict()
+    )
+
+    # Correction breakdown
+    report["correction_distribution"] = (
+        df["correction_status"].fillna("N/A").value_counts().to_dict()
+    )
+
+    # Success by country
+    country_stats = {}
+    for country in df["norm_country"].unique():
+        subset = df[df["norm_country"] == country]
+        total = len(subset)
+        validated = (subset["validation_status"] == "VALIDATED").sum()
+        corrected = (subset["validation_status"] == "CORRECTED").sum()
+        failed = (subset["validation_status"] == "FAILED").sum()
+        country_stats[country] = {
+            "total": total,
+            "validated": int(validated),
+            "corrected": int(corrected),
+            "failed": int(failed),
+            "success_rate": round(100 * (validated + corrected) / max(total, 1), 1),
+        }
+    report["country_breakdown"] = country_stats
+
+    # Success by quality tier
+    tier_stats = {}
+    for tier in df["quality_tier"].unique():
+        subset = df[df["quality_tier"] == tier]
+        total = len(subset)
+        success = ((subset["validation_status"] == "VALIDATED") |
+                   (subset["validation_status"] == "CORRECTED")).sum()
+        tier_stats[tier] = {
+            "total": total,
+            "success": int(success),
+            "success_rate": round(100 * success / max(total, 1), 1),
+        }
+    report["tier_breakdown"] = tier_stats
+
+    # Success by completeness class
+    comp_stats = {}
+    for cls in df["completeness_class"].unique():
+        subset = df[df["completeness_class"] == cls]
+        total = len(subset)
+        success = ((subset["validation_status"] == "VALIDATED") |
+                   (subset["validation_status"] == "CORRECTED")).sum()
+        comp_stats[cls] = {
+            "total": total,
+            "success": int(success),
+            "success_rate": round(100 * success / max(total, 1), 1),
+        }
+    report["completeness_breakdown"] = comp_stats
+
+    # Failure analysis
+    failed = df[df["validation_status"] == "FAILED"]
+    report["failure_analysis"] = {
+        "total_failed": len(failed),
+        "failure_reasons": failed["failure_reason"].value_counts().to_dict() if len(failed) > 0 else {},
+        "sample_failures": [],
+    }
+    for _, row in failed.head(10).iterrows():
+        report["failure_analysis"]["sample_failures"].append({
+            "MDM_KEY": str(row["MDM_KEY"]),
+            "SOURCE_NAME": row["SOURCE_NAME"],
+            "api_address": row.get("api_address", ""),
+            "country": row["norm_country"],
+            "failure_reason": row.get("failure_reason", ""),
+            "quality_tier": row.get("quality_tier", ""),
+            "completeness_class": row.get("completeness_class", ""),
+        })
+
+    # Manual review queue
+    manual = df[df["manual_review_flag"] == True]
+    report["manual_review"] = {
+        "total": len(manual),
+        "by_country": manual["norm_country"].value_counts().to_dict() if len(manual) > 0 else {},
+    }
+
+    # Correction effectiveness
+    corrections = df[df["correction_status"].notna() & (df["correction_status"] != "N/A")]
+    report["correction_effectiveness"] = {
+        "total_attempted": len(corrections),
+        "strategy_breakdown": corrections["correction_strategy"].value_counts().to_dict() if len(corrections) > 0 else {},
+    }
+
+    # Save
+    report_path = Path(output_dir) / "validation_report.json"
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    print(f"\n[Report] Saved to {report_path}")
+
+    return report
+
+
+# ──────────────────────────────────────────────
+# 5. MAIN RUNNER
+# ──────────────────────────────────────────────
+
+async def run_validation_pipeline(input_csv: str, output_dir: str = "output",
+                                   api_key: Optional[str] = None) -> pd.DataFrame:
+    """Run the complete validation pipeline."""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Load enhanced preprocessed data
+    df = pd.read_csv(input_csv)
+    print(f"[Validation] Loaded {len(df)} records from {input_csv}")
+
+    # Initialize and run pipeline
+    pipeline = ValidationPipeline(api_key=api_key)
+    df = await pipeline.validate_batch(df)
+
+    # Generate report
+    report = generate_validation_report(df, output_dir)
+
+    # Save outputs
+    output_path = Path(output_dir) / "stage2b_validated.csv"
+    df.to_csv(output_path, index=False)
+    print(f"[Output] Validated data saved to {output_path}")
+
+    # Save validated-only subset
+    validated = df[df["validation_status"].isin(["VALIDATED", "CORRECTED"])]
+    validated_path = Path(output_dir) / "stage2b_validated_only.csv"
+    validated.to_csv(validated_path, index=False)
+    print(f"[Output] Validated records: {len(validated)}/{len(df)} saved to {validated_path}")
+
+    # Save manual review queue
+    manual = df[df["manual_review_flag"] == True]
+    if len(manual) > 0:
+        manual_path = Path(output_dir) / "stage2b_manual_review.csv"
+        manual.to_csv(manual_path, index=False)
+        print(f"[Output] Manual review queue: {len(manual)} saved to {manual_path}")
+
+    return df
+
+
+def main():
+    import sys
+    import os
+
+    input_csv = sys.argv[1] if len(sys.argv) > 1 else "output/stage2a_enhanced.csv"
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else "output"
+    api_key = os.environ.get("GOOGLE_API_KEY", None)
+
+    df = asyncio.run(run_validation_pipeline(input_csv, output_dir, api_key))
+
+
+if __name__ == "__main__":
+    main()
