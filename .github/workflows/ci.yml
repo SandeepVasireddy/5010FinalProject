@@ -35,7 +35,7 @@ jobs:
       with:
         node-version: '24'
 
-    - name: Force Node.js 24 for all actions
+    - name: Force Node.js 24 globally
       run: echo "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true" >> $GITHUB_ENV
 
 env:
