@@ -1,6 +1,5 @@
 """
 MDM Pipeline - Stage 3: Company Verification & Enrichment
-Week 3 Deliverable
 
 This module starts from Stage 2B usable validated records and adds:
 1. Company-address verification using Azure Maps POI/search.
