@@ -7,8 +7,8 @@ Usage:
 
 Examples:
     python3 run_pipeline.py 100_sample_MDM.csv output
-    python3 run_pipeline.py data/34k_records.csv output --api-key AIzaSy...
-    GOOGLE_API_KEY=AIzaSy... python3 run_pipeline.py data/records.csv output
+    python3 run_pipeline.py data/34k_records.csv output --api-key <azure-maps-key>
+    AZURE_MAPS_KEY=<key> python3 run_pipeline.py data/records.csv output
 """
 
 import sys
@@ -17,6 +17,7 @@ import asyncio
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 
 # Import pipeline modules
 from stage1_preprocessing import run_stage1
@@ -35,7 +36,7 @@ def run_full_pipeline(csv_path: str, output_dir: str = "output",
     print("  MDM Address Validation & Enrichment Pipeline")
     print(f"  Input:   {csv_path}")
     print(f"  Output:  {output_dir}")
-    print(f"  API:     {'LIVE (Google Address Validation)' if api_key else 'SIMULATION'}")
+    print(f"  API:     {'LIVE (Azure Maps Search Address)' if api_key else 'SIMULATION'}")
     print(f"  Started: {start_time.isoformat()}")
     print("=" * 70)
 
@@ -75,9 +76,11 @@ def run_full_pipeline(csv_path: str, output_dir: str = "output",
     total = len(df)
     validated = (df["validation_status"] == "VALIDATED").sum()
     corrected = (df["validation_status"] == "CORRECTED").sum()
+    partial = (df["validation_status"] == "PARTIAL_VALIDATED").sum()
     failed = (df["validation_status"] == "FAILED").sum()
     skipped = (df["validation_status"] == "SKIPPED").sum()
-    success = validated + corrected
+    exact_success = validated + corrected
+    usable_success = exact_success + partial
 
     print("\n\n" + "=" * 70)
     print("  PIPELINE COMPLETE")
@@ -95,9 +98,11 @@ def run_full_pipeline(csv_path: str, output_dir: str = "output",
     print(f"\n  --- Stage 2 Results ---")
     print(f"  Validated (clean pass):   {validated} ({100*validated/total:.1f}%)")
     print(f"  Corrected & validated:    {corrected} ({100*corrected/total:.1f}%)")
+    print(f"  Partial validated:        {partial} ({100*partial/total:.1f}%)")
     print(f"  Failed:                   {failed} ({100*failed/total:.1f}%)")
     print(f"  Skipped:                  {skipped} ({100*skipped/total:.1f}%)")
-    print(f"\n  Overall success rate:     {success}/{total} ({100*success/total:.1f}%)")
+    print(f"\n  Exact success rate:       {exact_success}/{total} ({100*exact_success/total:.1f}%)")
+    print(f"  Usable success rate:      {usable_success}/{total} ({100*usable_success/total:.1f}%)")
     print(f"  Manual review queue:      {(df['manual_review_flag'] == True).sum()} records")
 
     print(f"\n  --- Output Files ---")
@@ -111,6 +116,8 @@ def run_full_pipeline(csv_path: str, output_dir: str = "output",
 
 
 if __name__ == "__main__":
+    load_dotenv()
+
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
@@ -124,7 +131,7 @@ if __name__ == "__main__":
         if arg == "--api-key" and i + 1 < len(sys.argv):
             api_key = sys.argv[i + 1]
     if not api_key:
-        api_key = os.environ.get("GOOGLE_API_KEY")
+        api_key = os.environ.get("AZURE_MAPS_KEY")
 
     if not Path(csv_path).exists():
         print(f"Error: File not found: {csv_path}")

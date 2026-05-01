@@ -15,6 +15,7 @@ import asyncio
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 
 from stage2a_enhanced_preprocessing import run_enhanced_preprocessing
 from stage2b_address_validation import run_validation_pipeline
@@ -86,6 +87,8 @@ def run_week2(input_csv: str, output_dir: str = "output",
 
 
 if __name__ == "__main__":
+    load_dotenv()
+
     input_csv = sys.argv[1] if len(sys.argv) > 1 else "output/stage1_processed.csv"
     output_dir = sys.argv[2] if len(sys.argv) > 2 else "output"
     api_key = None
@@ -97,6 +100,6 @@ if __name__ == "__main__":
 
     # Also check environment variable
     if not api_key:
-        api_key = os.environ.get("GOOGLE_API_KEY")
+        api_key = os.environ.get("AZURE_MAPS_KEY")
 
     df = run_week2(input_csv, output_dir, api_key)

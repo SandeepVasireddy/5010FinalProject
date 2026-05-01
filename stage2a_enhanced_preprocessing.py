@@ -94,6 +94,10 @@ MX_STATE_ABBREVS = {
     "YUC.": "Yucatán", "ZAC.": "Zacatecas",
 }
 
+ES_STATE_ABBREVS = {
+    "GU": "Guadalajara", "M": "Madrid", "B": "Barcelona", "V": "Valencia",
+}
+
 
 def expand_abbreviations(street: str, lang: str) -> tuple:
     """Expand street abbreviations based on detected language. Returns (expanded, actions)."""
@@ -119,12 +123,14 @@ def expand_abbreviations(street: str, lang: str) -> tuple:
 
 def expand_state(state: str, country: str) -> tuple:
     """Expand state abbreviations based on country. Returns (expanded, action)."""
+    upper = state.strip().upper()
     if country == "MX":
-        upper = state.strip().upper()
         # Try exact match, then with period
         for abbr, full in MX_STATE_ABBREVS.items():
             if upper == abbr or upper == abbr.rstrip("."):
                 return full, f"expanded_state_{state}"
+    if country == "ES" and upper in ES_STATE_ABBREVS:
+        return ES_STATE_ABBREVS[upper], f"expanded_es_state_{state}"
     return state, None
 
 
@@ -157,8 +163,8 @@ def normalize_postal_code(postal: str, country: str) -> tuple:
             postal = f"{clean[:3]} {clean[3:]}"
             action = "formatted_ca_postal"
 
-    elif country == "GB":
-        # UK: various formats, ensure space before last 3 chars
+    elif country in ("GB", "GG", "JE"):
+        # UK/Crown Dependency postcodes: ensure space before last 3 chars.
         clean = re.sub(r"\s+", "", postal).upper()
         if len(clean) >= 5:
             postal = f"{clean[:-3]} {clean[-3:]}"
@@ -177,6 +183,12 @@ def normalize_postal_code(postal: str, country: str) -> tuple:
         if len(digits) == 8:
             postal = f"{digits[:5]}-{digits[5:]}"
             action = "formatted_br_postal"
+
+    elif country in ("CN", "RU", "SA", "MX", "CL", "GT"):
+        digits = re.sub(r"[^0-9]", "", postal)
+        if digits:
+            postal = digits
+            action = f"cleaned_{country.lower()}_postal"
 
     return postal, action
 
@@ -229,8 +241,29 @@ CITY_COUNTRY_MAP = {
     "moscow": "RU", "saint petersburg": "RU",
 }
 
+
+def infer_country_from_components(street: str, city: str, state: str,
+                                  tagged_country: str, postal: str) -> tuple:
+    """Return a high-confidence corrected country code, if one is evident."""
+    country = tagged_country.strip().upper()
+    state_u = state.strip().upper()
+    postal_u = re.sub(r"\s+", "", postal.strip().upper())
+    combined = f"{street} {city} {state}".lower()
+
+    if country == "GU":
+        if postal_u.startswith("GY") or "guernsey" in combined:
+            return "GG", "GU code is Guam; address content indicates Guernsey"
+        if postal_u.startswith("JE") or "jersey" in combined:
+            return "JE", "GU code is Guam; address content indicates Jersey"
+        if "guatemala" in combined:
+            return "GT", "GU code is Guam; address content indicates Guatemala"
+        if state_u == "GU" or "guadalajara" in combined or postal_u.startswith(("18", "19")):
+            return "ES", "GU appears to be Spanish province Guadalajara, not country Guam"
+
+    return country, None
+
 def cross_validate_country(street: str, city: str, state: str,
-                           tagged_country: str, name: str) -> dict:
+                           tagged_country: str, name: str, postal: str = "") -> dict:
     """
     Cross-validate the tagged country code against address content.
     Returns dict with validation result and suggested correction.
@@ -241,14 +274,22 @@ def cross_validate_country(street: str, city: str, state: str,
         "suggested_country": tagged_country,
     }
 
+    inferred_country, inferred_reason = infer_country_from_components(
+        street, city, state, tagged_country, postal
+    )
+    if inferred_reason:
+        result["country_validated"] = False
+        result["country_mismatch_reason"] = inferred_reason
+        result["suggested_country"] = inferred_country
+
     # Check 1: CJK characters in address → should be CN (not HK, TW unless city matches)
     combined = f"{street} {city} {name}"
     if CJK_PATTERN.search(combined):
-        if tagged_country not in ("CN", "TW", "HK", "MO", "JP", "KR"):
+        if result["suggested_country"] not in ("CN", "TW", "HK", "MO", "JP", "KR"):
             result["country_validated"] = False
             result["country_mismatch_reason"] = "CJK characters in address but country is not CJK"
             result["suggested_country"] = "CN"
-        elif tagged_country == "HK" and ("北京" in combined or "上海" in combined or
+        elif result["suggested_country"] == "HK" and ("北京" in combined or "上海" in combined or
                                           "深圳" in combined or "广州" in combined):
             result["country_validated"] = False
             result["country_mismatch_reason"] = f"Address contains mainland China city but tagged as HK"
@@ -258,7 +299,7 @@ def cross_validate_country(street: str, city: str, state: str,
     city_lower = city.strip().lower()
     if city_lower in CITY_COUNTRY_MAP:
         expected = CITY_COUNTRY_MAP[city_lower]
-        if tagged_country != expected:
+        if result["suggested_country"] != expected:
             # Only flag if high confidence (exact city match)
             result["country_validated"] = False
             result["country_mismatch_reason"] = f"City '{city}' typically in {expected}, tagged as {tagged_country}"
@@ -315,7 +356,7 @@ def prepare_for_api(street: str, city: str, state: str, country: str,
     """
     Prepare address for API call.
     For non-Latin scripts, compose the address string in a format the API can handle.
-    Google Places API handles CJK natively; for other scripts, we note translation needs.
+    Azure Maps supports Unicode queries, but some scripts may still benefit from transliteration.
     """
     # Compose the full address string for API submission
     parts = []
@@ -323,7 +364,7 @@ def prepare_for_api(street: str, city: str, state: str, country: str,
         parts.append(street.strip())
     if city.strip():
         parts.append(city.strip())
-    if state.strip() and state.strip() != "nan":
+    if state.strip() and state.strip() != "nan" and state.strip().upper() != country.strip().upper():
         parts.append(state.strip())
     if postal.strip() and postal.strip() != "nan":
         parts.append(postal.strip())
@@ -338,7 +379,7 @@ def prepare_for_api(street: str, city: str, state: str, country: str,
 
     if needs_translation:
         if lang in ("zh", "ja", "ko"):
-            # Google handles CJK well — submit as-is
+            # Submit CJK addresses as-is; Azure Maps can search Unicode address text.
             api_strategy = "direct_cjk"
         else:
             api_strategy = "needs_transliteration"
@@ -402,18 +443,18 @@ def run_enhanced_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
         df.at[idx, "enhanced_postal"] = norm_postal
 
         # 5. Country cross-validation
-        cv = cross_validate_country(expanded_street, city, expanded_state, country, name)
+        cv = cross_validate_country(expanded_street, city, expanded_state, country, name, norm_postal)
         df.at[idx, "country_validated"] = cv["country_validated"]
         df.at[idx, "country_mismatch_reason"] = cv["country_mismatch_reason"] or ""
         df.at[idx, "suggested_country"] = cv["suggested_country"]
 
         # 6. Completeness scoring
-        cs = score_address_completeness(expanded_street, city, expanded_state, country, norm_postal)
+        api_country = cv["suggested_country"]  # Use corrected country if mismatch detected
+        cs = score_address_completeness(expanded_street, city, expanded_state, api_country, norm_postal)
         df.at[idx, "completeness_score"] = cs["completeness_score"]
         df.at[idx, "completeness_class"] = cs["completeness_class"]
 
         # 7. API preparation
-        api_country = cv["suggested_country"]  # Use corrected country if mismatch detected
         ap = prepare_for_api(expanded_street, city, expanded_state,
                              api_country, norm_postal, name, lang)
         df.at[idx, "api_address"] = ap["api_address"]

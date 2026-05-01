@@ -33,6 +33,10 @@ def load_and_parse(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path, dtype=str)
     df.columns = df.columns.str.strip()
 
+    # Fix mojibake before splitting so parsed components inherit repaired text.
+    if "FULL_ADDRESS" in df.columns:
+        df["FULL_ADDRESS"] = df["FULL_ADDRESS"].apply(repair_encoding)
+
     # Parse FULL_ADDRESS into components
     addr_parts = df["FULL_ADDRESS"].str.split(re.escape(ADDRESS_DELIMITER), expand=True)
 
@@ -78,20 +82,19 @@ def apply_encoding_repair(df: pd.DataFrame) -> pd.DataFrame:
                  "name_reason", "address_reason"]
 
     repair_count = 0
+    repaired_rows = pd.Series(False, index=df.index)
     for col in text_cols:
         if col in df.columns:
             original = df[col].copy()
             df[col] = df[col].apply(repair_encoding)
-            changed = (original != df[col]).sum()
+            changed_mask = original.fillna("") != df[col].fillna("")
+            repaired_rows |= changed_mask.fillna(False)
+            changed = changed_mask.sum()
             repair_count += changed
             if changed > 0:
                 print(f"  [Encoding] Repaired {changed} values in '{col}'")
 
-    df["flag_encoding_repaired"] = False
-    # Mark rows where street or name changed
-    for col in ["SOURCE_NAME", "parsed_street", "parsed_city", "parsed_state"]:
-        if col in df.columns:
-            pass  # We track this in the flags step below
+    df["flag_encoding_repaired"] = repaired_rows
 
     print(f"[Encoding] Total field-level repairs: {repair_count}")
     return df
@@ -230,6 +233,32 @@ STATE_ABBREVIATIONS = {
     "CDMX": "Ciudad de México", "JAL.": "Jalisco",
 }
 
+ES_STATE_ABBREVIATIONS = {
+    "GU": "Guadalajara", "M": "Madrid", "B": "Barcelona", "V": "Valencia",
+}
+
+
+def infer_country_code(street: str, city: str, state: str, country: str, postal: str) -> tuple:
+    """Correct high-confidence country-code mistakes before API preparation."""
+    street_l = str(street).lower()
+    city_l = str(city).lower()
+    state_u = str(state).strip().upper()
+    country_u = str(country).strip().upper()
+    postal_u = re.sub(r"\s+", "", str(postal).strip().upper())
+    combined = f"{street_l} {city_l} {state_u.lower()} {postal_u.lower()}"
+
+    if country_u == "GU":
+        if postal_u.startswith("GY") or "guernsey" in combined:
+            return "GG", "country_gu_to_gg_guernsey"
+        if postal_u.startswith("JE") or "jersey" in combined:
+            return "JE", "country_gu_to_je_jersey"
+        if "guatemala" in combined:
+            return "GT", "country_gu_to_gt_guatemala"
+        if state_u == "GU" or "guadalajara" in combined or postal_u.startswith(("19", "18")):
+            return "ES", "country_gu_to_es_guadalajara"
+
+    return country_u, None
+
 def normalize_address(street: str, city: str, state: str, country: str, postal: str) -> dict:
     """
     Normalize address components:
@@ -277,11 +306,22 @@ def normalize_address(street: str, city: str, state: str, country: str, postal: 
         normalized_city = normalized_city.title()
         actions.append("titlecased_city")
 
+    normalized_country, country_action = infer_country_code(
+        normalized_street, normalized_city, normalized_state, country, postal
+    )
+    if country_action:
+        actions.append(country_action)
+
+    if normalized_country == "ES" and normalized_state.upper() in ES_STATE_ABBREVIATIONS:
+        old_state = normalized_state
+        normalized_state = ES_STATE_ABBREVIATIONS[normalized_state.upper()]
+        actions.append(f"expanded_es_state_{old_state}")
+
     return {
         "norm_street": normalized_street,
         "norm_city": normalized_city,
         "norm_state": normalized_state,
-        "norm_country": country.strip().upper(),
+        "norm_country": normalized_country,
         "norm_postal": normalized_postal,
         "normalization_actions": actions,
     }
@@ -416,12 +456,8 @@ def flag_quality_issues(df: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     )
 
-    # Flag: Encoding was repaired
-    flags["flag_encoding_repaired"] = df.apply(
-        lambda row: row["parsed_street"] != row["norm_street"]
-        or row["SOURCE_NAME"] != row.get("cleaned_name", row["SOURCE_NAME"]),
-        axis=1,
-    )
+    # Flag: Encoding was repaired in the dedicated encoding step
+    flags["flag_encoding_repaired"] = df.get("flag_encoding_repaired", False)
 
     # Flag: Very long/complex street (might contain multiple addresses)
     flags["flag_complex_address"] = df["norm_street"].apply(

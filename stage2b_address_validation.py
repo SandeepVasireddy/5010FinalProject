@@ -3,7 +3,7 @@ MDM Pipeline — Stage 2B: Address Validation & Correction Engine
 Week 2 Deliverable
 
 This module implements:
-1. Address Validation API integration (Google Address Validation API)
+1. Address Validation API integration (Azure Maps Search Address API)
    - With simulation/mock mode for development without API keys
 2. Validation result parsing and diagnostic extraction
 3. Address correction logic (auto-fix using API suggestions)
@@ -24,25 +24,29 @@ import json
 import time
 import hashlib
 import asyncio
+import os
 import aiohttp
 from typing import Optional
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 
 # ──────────────────────────────────────────────
-# 1. GOOGLE ADDRESS VALIDATION API CLIENT
+# 1. AZURE MAPS ADDRESS SEARCH API CLIENT
 # ──────────────────────────────────────────────
 
 class AddressValidationClient:
     """
-    Client for Google Address Validation API.
+    Client for Azure Maps Search Address API.
     Falls back to simulation mode when API key is not available.
     """
 
-    GOOGLE_API_URL = "https://addressvalidation.googleapis.com/v1:validateAddress"
+    DEFAULT_AZURE_ADDRESS_URL = "https://atlas.microsoft.com/search/address/json"
 
-    def __init__(self, api_key: Optional[str] = None, use_simulation: bool = True):
+    def __init__(self, api_key: Optional[str] = None, api_url: Optional[str] = None,
+                 use_simulation: bool = True):
         self.api_key = api_key
+        self.api_url = api_url or os.environ.get("AZURE_MAPS_ADDRESS_URL", self.DEFAULT_AZURE_ADDRESS_URL)
         self.use_simulation = use_simulation if not api_key else False
         self.call_count = 0
         self.rate_limit_delay = 0.1  # seconds between API calls
@@ -50,7 +54,7 @@ class AddressValidationClient:
         if self.use_simulation:
             print("[AddressValidation] Running in SIMULATION mode (no API key)")
         else:
-            print(f"[AddressValidation] Using Google Address Validation API")
+            print("[AddressValidation] Using Azure Maps Search Address API")
 
     async def validate_address(self, address: str, country: str,
                                session: Optional[aiohttp.ClientSession] = None) -> dict:
@@ -60,29 +64,30 @@ class AddressValidationClient:
         if self.use_simulation:
             return self._simulate_validation(address, country)
 
-        return await self._call_google_api(address, country, session)
+        return await self._call_azure_maps_api(address, country, session)
 
-    async def _call_google_api(self, address: str, country: str,
-                               session: aiohttp.ClientSession) -> dict:
-        """Call the actual Google Address Validation API."""
-        payload = {
-            "address": {
-                "addressLines": [address],
-                "regionCode": country,
-            },
-            "enableUspsCass": country == "US",
+    async def _call_azure_maps_api(self, address: str, country: str,
+                                   session: aiohttp.ClientSession) -> dict:
+        """Call Azure Maps Search Address API."""
+        params = {
+            "api-version": "1.0",
+            "subscription-key": self.api_key,
+            "query": address,
+            "limit": 1,
         }
+        if country and len(country.strip()) == 2:
+            params["countrySet"] = country.strip().upper()
 
         try:
             await asyncio.sleep(self.rate_limit_delay)
-            async with session.post(
-                f"{self.GOOGLE_API_URL}?key={self.api_key}",
-                json=payload,
+            async with session.get(
+                self.api_url,
+                params=params,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return self._parse_google_response(data, address)
+                    return self._parse_azure_maps_response(data, address)
                 else:
                     error_text = await resp.text()
                     return {
@@ -103,62 +108,78 @@ class AddressValidationClient:
                 "original_address": address,
             }
 
-    def _parse_google_response(self, data: dict, original: str) -> dict:
-        """Parse Google Address Validation API response into standardized format."""
-        result = data.get("result", {})
-        verdict = result.get("verdict", {})
-        address = result.get("address", {})
-        geocode = result.get("geocode", {})
-
-        # Extract components
-        formatted = address.get("formattedAddress", "")
-        components = {}
-        for comp in address.get("addressComponents", []):
-            comp_type = comp.get("componentType", "")
-            components[comp_type] = {
-                "value": comp.get("componentName", {}).get("text", ""),
-                "confirmed": comp.get("confirmationLevel", "") == "CONFIRMED",
-                "inferred": comp.get("inferred", False),
-                "replaced": comp.get("replaced", False),
+    def _parse_azure_maps_response(self, data: dict, original: str) -> dict:
+        """Parse Azure Maps search response into the pipeline's standard format."""
+        results = data.get("results", [])
+        if not results:
+            return {
+                "validation_status": "FAILED",
+                "formatted_address": "",
+                "latitude": None,
+                "longitude": None,
+                "validation_granularity": "NONE",
+                "components": {},
+                "diagnostics": ["address: no Azure Maps match"],
+                "has_unconfirmed": True,
+                "has_inferred": False,
+                "has_replaced": False,
+                "original_address": original,
+                "api_error": None,
             }
 
-        # Extract location
-        location = geocode.get("location", {})
-        lat = location.get("latitude")
-        lng = location.get("longitude")
+        best = results[0]
+        address = best.get("address", {})
+        position = best.get("position", {})
+        score = float(best.get("score", 0) or 0)
+        result_type = self._normalize_azure_type(best.get("type", ""))
+        entity_type = self._normalize_azure_type(best.get("entityType", ""))
+        match_type = self._normalize_azure_type(best.get("matchType", ""))
+        formatted = address.get("freeformAddress", "")
 
-        # Determine validation status
-        input_granularity = verdict.get("inputGranularity", "")
-        validation_granularity = verdict.get("validationGranularity", "")
-        has_unconfirmed = verdict.get("hasUnconfirmedComponents", False)
-        has_inferred = verdict.get("hasInferredComponents", False)
-        has_replaced = verdict.get("hasReplacedComponents", False)
+        components = {
+            "street_number": {"value": address.get("streetNumber", ""), "confirmed": bool(address.get("streetNumber"))},
+            "street_name": {"value": address.get("streetName", ""), "confirmed": bool(address.get("streetName"))},
+            "municipality": {"value": address.get("municipality", ""), "confirmed": bool(address.get("municipality"))},
+            "country_subdivision": {"value": address.get("countrySubdivision", ""), "confirmed": bool(address.get("countrySubdivision"))},
+            "postal_code": {"value": address.get("postalCode", ""), "confirmed": bool(address.get("postalCode"))},
+            "country": {"value": address.get("countryCode", ""), "confirmed": bool(address.get("countryCode"))},
+        }
 
-        if validation_granularity in ("PREMISE", "SUB_PREMISE") and not has_unconfirmed:
-            status = "VALIDATED"
-        elif has_replaced or has_inferred:
-            status = "CORRECTED"
-        elif validation_granularity in ("ROUTE", "BLOCK"):
+        granularity = self._azure_granularity(result_type, entity_type, match_type, components)
+        has_unconfirmed = score < 0.80 or granularity in ("LOCALITY", "NONE", "OTHER")
+        has_inferred = (
+            score >= 0.80
+            and not self._addresses_equivalent(formatted, original)
+        )
+        has_replaced = match_type in ("pointaddress", "addressrange") and has_inferred
+
+        if score >= 0.80 and granularity in ("PREMISE", "SUB_PREMISE"):
+            status = "CORRECTED" if has_inferred else "VALIDATED"
+        elif score >= 0.70 and granularity in ("PREMISE", "SUB_PREMISE"):
+            status = "PARTIAL_VALIDATED"
+        elif score >= 0.90 and granularity == "ROUTE" and components["street_name"]["confirmed"]:
+            status = "PARTIAL_VALIDATED"
+        elif score >= 0.60 and granularity in ("ROUTE", "LOCALITY"):
             status = "PARTIAL_MATCH"
         else:
             status = "FAILED"
 
-        # Build diagnostic
         diagnostics = []
         for comp_type, comp_data in components.items():
-            if comp_data.get("replaced"):
-                diagnostics.append(f"{comp_type}: replaced")
-            if comp_data.get("inferred"):
-                diagnostics.append(f"{comp_type}: inferred")
             if not comp_data.get("confirmed"):
                 diagnostics.append(f"{comp_type}: unconfirmed")
+        diagnostics.append(f"azure_score: {score:.3f}")
+        if result_type:
+            diagnostics.append(f"azure_type: {result_type}")
+        if match_type:
+            diagnostics.append(f"match_type: {match_type}")
 
         return {
             "validation_status": status,
             "formatted_address": formatted,
-            "latitude": lat,
-            "longitude": lng,
-            "validation_granularity": validation_granularity,
+            "latitude": position.get("lat"),
+            "longitude": position.get("lon"),
+            "validation_granularity": granularity,
             "components": components,
             "diagnostics": diagnostics,
             "has_unconfirmed": has_unconfirmed,
@@ -167,6 +188,54 @@ class AddressValidationClient:
             "original_address": original,
             "api_error": None,
         }
+
+    @staticmethod
+    def _normalize_azure_type(value: str) -> str:
+        """Normalize Azure result labels like 'Point Address' for simple comparisons."""
+        return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+    @staticmethod
+    def _addresses_equivalent(left: str, right: str) -> bool:
+        """Compare addresses while ignoring API-only formatting and common abbreviations."""
+        def canonical(value: str) -> str:
+            text = str(value).lower()
+            replacements = {
+                r"\bn\b": "north", r"\bs\b": "south", r"\be\b": "east", r"\bw\b": "west",
+                r"\brd\b": "road", r"\brd\.\b": "road",
+                r"\bave\b": "avenue", r"\bave\.\b": "avenue",
+                r"\bst\b": "street", r"\bst\.\b": "street",
+                r"\bln\b": "lane", r"\bln\.\b": "lane",
+                r"\bdr\b": "drive", r"\bdr\.\b": "drive",
+                r"\bblvd\b": "boulevard", r"\bblvd\.\b": "boulevard",
+                r"\bsgt\b": "sargeant", r"\bste\b": "suite",
+            }
+            for pattern, replacement in replacements.items():
+                text = re.sub(pattern, replacement, text)
+            # Azure freeformAddress often omits the trailing country already supplied as countrySet.
+            text = re.sub(r"\b(us|usa|united states|ca|canada|gb|uk|de|fr|es|it|au)\b", " ", text)
+            text = re.sub(r"[^a-z0-9]+", " ", text)
+            return re.sub(r"\s+", " ", text).strip()
+
+        left_c = canonical(left)
+        right_c = canonical(right)
+        return bool(left_c and right_c) and (left_c == right_c or left_c in right_c or right_c in left_c)
+
+    @staticmethod
+    def _azure_granularity(result_type: str, entity_type: str, match_type: str,
+                           components: dict) -> str:
+        """Map Azure search result metadata to this pipeline's granularity terms."""
+        best_type = match_type or result_type or entity_type
+        if best_type == "pointaddress":
+            return "PREMISE"
+        if best_type == "addressrange":
+            return "PREMISE" if components["street_number"]["confirmed"] else "ROUTE"
+        if best_type in ("address", "streetaddress") and components["street_number"]["confirmed"]:
+            return "PREMISE"
+        if best_type in ("street", "streetname"):
+            return "ROUTE"
+        if best_type in ("geography", "municipality", "municipalitysubdivision", "countrysecondarysubdivision"):
+            return "LOCALITY"
+        return "OTHER"
 
     def _simulate_validation(self, address: str, country: str) -> dict:
         """
@@ -253,7 +322,7 @@ class AddressValidationClient:
 
         # Generate simulated formatted address (slightly cleaned version)
         formatted = address.strip()
-        if status in ("VALIDATED", "CORRECTED"):
+        if status in ("VALIDATED", "CORRECTED", "PARTIAL_VALIDATED"):
             # Title case city names, standardize country
             formatted_parts = [p.strip() for p in formatted.split(",")]
             if len(formatted_parts) >= 2:
@@ -277,12 +346,13 @@ class AddressValidationClient:
 
         return {
             "validation_status": status,
-            "formatted_address": formatted if status != "FAILED" else "",
-            "latitude": round(lat, 6) if status != "FAILED" else None,
-            "longitude": round(lng, 6) if status != "FAILED" else None,
+            "formatted_address": formatted if status not in ("FAILED", "PARTIAL_MATCH") else "",
+            "latitude": round(lat, 6) if status not in ("FAILED", "PARTIAL_MATCH") else None,
+            "longitude": round(lng, 6) if status not in ("FAILED", "PARTIAL_MATCH") else None,
             "validation_granularity": {
                 "VALIDATED": "PREMISE",
                 "CORRECTED": "PREMISE",
+                "PARTIAL_VALIDATED": "ROUTE",
                 "PARTIAL_MATCH": "ROUTE",
                 "FAILED": "OTHER",
             }[status],
@@ -344,10 +414,10 @@ class AddressCorrectionEngine:
                 result["correction_input"] = corrected
                 attempts.append(result)
 
-                if result["validation_status"] in ("VALIDATED", "CORRECTED"):
+                if result["validation_status"] in ("VALIDATED", "CORRECTED", "PARTIAL_VALIDATED"):
                     self.success_count += 1
                     return {
-                        "correction_status": "CORRECTED",
+                        "correction_status": result["validation_status"],
                         "corrected_address": result.get("formatted_address", corrected),
                         "correction_strategy": strategy,
                         "correction_attempts": len(attempts),
@@ -381,8 +451,15 @@ class AddressCorrectionEngine:
                 elif parts and re.match(r"^[A-Z0-9\s]{3,10}$", parts[-1]):
                     corrected = ", ".join(parts[:-1])
 
-            # Fix: street number issues → try with just street name
-            if any("street_number" in d for d in diagnostics):
+            score = None
+            for diagnostic in diagnostics:
+                match = re.search(r"azure_score: ([0-9.]+)", diagnostic)
+                if match:
+                    score = float(match.group(1))
+                    break
+
+            # Fix: street number issues → only strip the number on weak matches.
+            if any("street_number" in d for d in diagnostics) and (score is None or score < 0.75):
                 # Remove leading numbers
                 corrected = re.sub(r"^\d+[-/]?\d*\s*", "", corrected)
 
@@ -506,7 +583,8 @@ class ValidationPipeline:
                 processed = min(end, total)
                 print(f"  Processed {processed}/{total} records "
                       f"(V:{self.stats['validated']} C:{self.stats['corrected']} "
-                      f"F:{self.stats['failed']} S:{self.stats['skipped']})")
+                      f"P:{self.stats['partial']} F:{self.stats['failed']} "
+                      f"S:{self.stats['skipped']})")
 
         self._print_summary(total)
         return df
@@ -582,23 +660,44 @@ class ValidationPipeline:
                 "validation_timestamp": timestamp,
             }
 
+        elif status == "PARTIAL_VALIDATED":
+            self.stats["partial"] += 1
+            return {
+                "validation_status": "PARTIAL_VALIDATED",
+                "validated_address": result.get("formatted_address", ""),
+                "latitude": result.get("latitude"),
+                "longitude": result.get("longitude"),
+                "validation_granularity": result.get("validation_granularity", ""),
+                "validation_diagnostics": json.dumps(result.get("diagnostics", [])),
+                "correction_status": "API_PARTIAL",
+                "correction_strategy": "api_partial",
+                "correction_attempts": 0,
+                "failure_reason": None,
+                "manual_review_flag": False,
+                "validation_timestamp": timestamp,
+            }
+
         else:
             # Step 3: Attempt correction for PARTIAL_MATCH or FAILED
             correction = await self.corrector.attempt_correction(
                 api_address, country, result, session
             )
 
-            if correction["correction_status"] == "CORRECTED":
-                self.stats["corrected"] += 1
+            if correction["correction_status"] in ("CORRECTED", "PARTIAL_VALIDATED"):
                 final_result = correction["validation_result"]
+                final_status = correction["correction_status"]
+                if final_status == "CORRECTED":
+                    self.stats["corrected"] += 1
+                else:
+                    self.stats["partial"] += 1
                 return {
-                    "validation_status": "CORRECTED",
+                    "validation_status": final_status,
                     "validated_address": correction.get("corrected_address", ""),
                     "latitude": final_result.get("latitude"),
                     "longitude": final_result.get("longitude"),
                     "validation_granularity": final_result.get("validation_granularity", ""),
                     "validation_diagnostics": json.dumps(final_result.get("diagnostics", [])),
-                    "correction_status": "ENGINE_CORRECTED",
+                    "correction_status": "ENGINE_CORRECTED" if final_status == "CORRECTED" else "ENGINE_PARTIAL",
                     "correction_strategy": correction.get("correction_strategy", ""),
                     "correction_attempts": correction.get("correction_attempts", 0),
                     "failure_reason": None,
@@ -632,6 +731,8 @@ class ValidationPipeline:
               f"({100*self.stats['validated']/max(total,1):.1f}%)")
         print(f"  Corrected:             {self.stats['corrected']} "
               f"({100*self.stats['corrected']/max(total,1):.1f}%)")
+        print(f"  Partial validated:     {self.stats['partial']} "
+              f"({100*self.stats['partial']/max(total,1):.1f}%)")
         print(f"  Failed:                {self.stats['failed']} "
               f"({100*self.stats['failed']/max(total,1):.1f}%)")
         print(f"  Skipped:               {self.stats['skipped']} "
@@ -641,9 +742,12 @@ class ValidationPipeline:
         print(f"  Correction attempts:   {self.corrector.correction_count}")
         print(f"  Correction successes:  {self.corrector.success_count}")
 
-        success = self.stats['validated'] + self.stats['corrected']
-        print(f"\n  Overall success rate:  {success}/{total} "
-              f"({100*success/max(total,1):.1f}%)")
+        exact_success = self.stats['validated'] + self.stats['corrected']
+        usable_success = exact_success + self.stats['partial']
+        print(f"\n  Exact success rate:    {exact_success}/{total} "
+              f"({100*exact_success/max(total,1):.1f}%)")
+        print(f"  Usable success rate:   {usable_success}/{total} "
+              f"({100*usable_success/max(total,1):.1f}%)")
         print(f"  Manual review queue:   {self.stats['failed'] + self.stats['skipped']} records")
         print(f"{'='*60}")
 
@@ -669,6 +773,16 @@ def generate_validation_report(df: pd.DataFrame, output_dir: str) -> dict:
         df["correction_status"].fillna("N/A").value_counts().to_dict()
     )
 
+    exact_mask = df["validation_status"].isin(["VALIDATED", "CORRECTED"])
+    usable_mask = df["validation_status"].isin(["VALIDATED", "CORRECTED", "PARTIAL_VALIDATED"])
+    report["success_summary"] = {
+        "exact_success": int(exact_mask.sum()),
+        "exact_success_rate": round(100 * exact_mask.sum() / max(len(df), 1), 1),
+        "usable_success": int(usable_mask.sum()),
+        "usable_success_rate": round(100 * usable_mask.sum() / max(len(df), 1), 1),
+        "partial_validated": int((df["validation_status"] == "PARTIAL_VALIDATED").sum()),
+    }
+
     # Success by country
     country_stats = {}
     for country in df["norm_country"].unique():
@@ -676,13 +790,16 @@ def generate_validation_report(df: pd.DataFrame, output_dir: str) -> dict:
         total = len(subset)
         validated = (subset["validation_status"] == "VALIDATED").sum()
         corrected = (subset["validation_status"] == "CORRECTED").sum()
+        partial = (subset["validation_status"] == "PARTIAL_VALIDATED").sum()
         failed = (subset["validation_status"] == "FAILED").sum()
         country_stats[country] = {
             "total": total,
             "validated": int(validated),
             "corrected": int(corrected),
+            "partial_validated": int(partial),
             "failed": int(failed),
-            "success_rate": round(100 * (validated + corrected) / max(total, 1), 1),
+            "exact_success_rate": round(100 * (validated + corrected) / max(total, 1), 1),
+            "usable_success_rate": round(100 * (validated + corrected + partial) / max(total, 1), 1),
         }
     report["country_breakdown"] = country_stats
 
@@ -691,12 +808,14 @@ def generate_validation_report(df: pd.DataFrame, output_dir: str) -> dict:
     for tier in df["quality_tier"].unique():
         subset = df[df["quality_tier"] == tier]
         total = len(subset)
-        success = ((subset["validation_status"] == "VALIDATED") |
-                   (subset["validation_status"] == "CORRECTED")).sum()
+        exact_success = subset["validation_status"].isin(["VALIDATED", "CORRECTED"]).sum()
+        usable_success = subset["validation_status"].isin(["VALIDATED", "CORRECTED", "PARTIAL_VALIDATED"]).sum()
         tier_stats[tier] = {
             "total": total,
-            "success": int(success),
-            "success_rate": round(100 * success / max(total, 1), 1),
+            "exact_success": int(exact_success),
+            "exact_success_rate": round(100 * exact_success / max(total, 1), 1),
+            "usable_success": int(usable_success),
+            "usable_success_rate": round(100 * usable_success / max(total, 1), 1),
         }
     report["tier_breakdown"] = tier_stats
 
@@ -705,12 +824,14 @@ def generate_validation_report(df: pd.DataFrame, output_dir: str) -> dict:
     for cls in df["completeness_class"].unique():
         subset = df[df["completeness_class"] == cls]
         total = len(subset)
-        success = ((subset["validation_status"] == "VALIDATED") |
-                   (subset["validation_status"] == "CORRECTED")).sum()
+        exact_success = subset["validation_status"].isin(["VALIDATED", "CORRECTED"]).sum()
+        usable_success = subset["validation_status"].isin(["VALIDATED", "CORRECTED", "PARTIAL_VALIDATED"]).sum()
         comp_stats[cls] = {
             "total": total,
-            "success": int(success),
-            "success_rate": round(100 * success / max(total, 1), 1),
+            "exact_success": int(exact_success),
+            "exact_success_rate": round(100 * exact_success / max(total, 1), 1),
+            "usable_success": int(usable_success),
+            "usable_success_rate": round(100 * usable_success / max(total, 1), 1),
         }
     report["completeness_breakdown"] = comp_stats
 
@@ -762,6 +883,10 @@ def generate_validation_report(df: pd.DataFrame, output_dir: str) -> dict:
 async def run_validation_pipeline(input_csv: str, output_dir: str = "output",
                                    api_key: Optional[str] = None) -> pd.DataFrame:
     """Run the complete validation pipeline."""
+    load_dotenv()
+    if not api_key:
+        api_key = os.environ.get("AZURE_MAPS_KEY", None)
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Load enhanced preprocessed data
@@ -780,11 +905,11 @@ async def run_validation_pipeline(input_csv: str, output_dir: str = "output",
     df.to_csv(output_path, index=False)
     print(f"[Output] Validated data saved to {output_path}")
 
-    # Save validated-only subset
-    validated = df[df["validation_status"].isin(["VALIDATED", "CORRECTED"])]
+    # Save usable validated subset, including route/medium-confidence partial matches.
+    validated = df[df["validation_status"].isin(["VALIDATED", "CORRECTED", "PARTIAL_VALIDATED"])]
     validated_path = Path(output_dir) / "stage2b_validated_only.csv"
     validated.to_csv(validated_path, index=False)
-    print(f"[Output] Validated records: {len(validated)}/{len(df)} saved to {validated_path}")
+    print(f"[Output] Usable validated records: {len(validated)}/{len(df)} saved to {validated_path}")
 
     # Save manual review queue
     manual = df[df["manual_review_flag"] == True]
@@ -800,9 +925,11 @@ def main():
     import sys
     import os
 
+    load_dotenv()
+
     input_csv = sys.argv[1] if len(sys.argv) > 1 else "output/stage2a_enhanced.csv"
     output_dir = sys.argv[2] if len(sys.argv) > 2 else "output"
-    api_key = os.environ.get("GOOGLE_API_KEY", None)
+    api_key = os.environ.get("AZURE_MAPS_KEY", None)
 
     df = asyncio.run(run_validation_pipeline(input_csv, output_dir, api_key))
 
