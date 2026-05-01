@@ -25,6 +25,7 @@ import time
 import hashlib
 import asyncio
 import os
+import copy
 import aiohttp
 from typing import Optional
 from pathlib import Path
@@ -49,6 +50,10 @@ class AddressValidationClient:
         self.api_url = api_url or os.environ.get("AZURE_MAPS_ADDRESS_URL", self.DEFAULT_AZURE_ADDRESS_URL)
         self.use_simulation = use_simulation if not api_key else False
         self.call_count = 0
+        self.cache_hits = 0
+        self._cache = {}
+        self._inflight = {}
+        self._cache_lock = asyncio.Lock()
         self.rate_limit_delay = 0.1  # seconds between API calls
 
         if self.use_simulation:
@@ -59,6 +64,44 @@ class AddressValidationClient:
     async def validate_address(self, address: str, country: str,
                                session: Optional[aiohttp.ClientSession] = None) -> dict:
         """Validate a single address. Returns structured result."""
+        key = self._cache_key(address, country)
+
+        async with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self.cache_hits += 1
+                return copy.deepcopy(cached)
+
+            task = self._inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(self._validate_address_uncached(address, country, session))
+                self._inflight[key] = task
+                owner = True
+            else:
+                owner = False
+
+        result = await task
+
+        if owner:
+            async with self._cache_lock:
+                self._inflight.pop(key, None)
+                if not result.get("api_error"):
+                    self._cache[key] = copy.deepcopy(result)
+        else:
+            self.cache_hits += 1
+
+        return copy.deepcopy(result)
+
+    @staticmethod
+    def _cache_key(address: str, country: str) -> tuple:
+        """Normalize cache keys so repeated rows share one API response."""
+        address_key = re.sub(r"\s+", " ", str(address).strip().lower())
+        country_key = str(country).strip().upper()
+        return address_key, country_key
+
+    async def _validate_address_uncached(self, address: str, country: str,
+                                         session: Optional[aiohttp.ClientSession] = None) -> dict:
+        """Validate a single address without consulting the in-memory cache."""
         self.call_count += 1
 
         if self.use_simulation:
@@ -157,7 +200,18 @@ class AddressValidationClient:
             status = "CORRECTED" if has_inferred else "VALIDATED"
         elif score >= 0.70 and granularity in ("PREMISE", "SUB_PREMISE"):
             status = "PARTIAL_VALIDATED"
-        elif score >= 0.90 and granularity == "ROUTE" and components["street_name"]["confirmed"]:
+        elif (
+            score >= 0.90
+            and granularity == "ROUTE"
+            and components["street_name"]["confirmed"]
+        ):
+            status = "PARTIAL_VALIDATED"
+        elif (
+            score >= 0.85
+            and granularity == "ROUTE"
+            and components["street_name"]["confirmed"]
+            and self._route_partial_candidate(original)
+        ):
             status = "PARTIAL_VALIDATED"
         elif score >= 0.60 and granularity in ("ROUTE", "LOCALITY"):
             status = "PARTIAL_MATCH"
@@ -219,6 +273,21 @@ class AddressValidationClient:
         left_c = canonical(left)
         right_c = canonical(right)
         return bool(left_c and right_c) and (left_c == right_c or left_c in right_c or right_c in left_c)
+
+    @staticmethod
+    def _route_partial_candidate(original: str) -> bool:
+        """Allow lower route scores only when the submitted street looks concrete."""
+        text = str(original)
+        if re.search(r"\b(x+x+|closed|tbd|operational|unknown|n/?a)\b", text, re.IGNORECASE):
+            return False
+
+        first_component = text.split(",", 1)[0].strip()
+        has_numeric_street_ref = bool(re.search(r"\d", first_component))
+        has_number_word = bool(re.match(
+            r"(?i)^\s*(one|two|three|four|five|six|seven|eight|nine|ten)\b",
+            first_component,
+        ))
+        return has_numeric_street_ref or has_number_word
 
     @staticmethod
     def _azure_granularity(result_type: str, entity_type: str, match_type: str,
@@ -739,6 +808,7 @@ class ValidationPipeline:
               f"({100*self.stats['skipped']/max(total,1):.1f}%)")
         print(f"  API errors:            {self.stats['api_errors']}")
         print(f"  API calls made:        {self.client.call_count}")
+        print(f"  API cache hits:        {self.client.cache_hits}")
         print(f"  Correction attempts:   {self.corrector.correction_count}")
         print(f"  Correction successes:  {self.corrector.success_count}")
 
@@ -748,7 +818,8 @@ class ValidationPipeline:
               f"({100*exact_success/max(total,1):.1f}%)")
         print(f"  Usable success rate:   {usable_success}/{total} "
               f"({100*usable_success/max(total,1):.1f}%)")
-        print(f"  Manual review queue:   {self.stats['failed'] + self.stats['skipped']} records")
+        manual_review = self.stats["failed"] + self.stats["skipped"] + self.stats["api_errors"]
+        print(f"  Manual review queue:   {manual_review} records")
         print(f"{'='*60}")
 
 
