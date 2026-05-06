@@ -26,6 +26,176 @@ import pandas as pd
 from dotenv import load_dotenv
 
 
+class ExternalEvidenceIndex:
+    """Optional offline web/search evidence loaded from a CSV or JSON file."""
+
+    def __init__(self, path: Optional[str] = None):
+        self.path = path or os.environ.get("WEB_EVIDENCE_FILE")
+        self.records = {}
+        self.enabled = False
+        if not self.path:
+            return
+        self._load(Path(self.path))
+
+    def _load(self, path: Path):
+        if not path.exists():
+            print(f"[ExternalEvidence] File not found: {path}")
+            return
+        try:
+            if path.suffix.lower() == ".json":
+                data = json.loads(path.read_text(encoding="utf-8"))
+                rows = data if isinstance(data, list) else data.get("records", [])
+                df = pd.DataFrame(rows)
+            else:
+                df = pd.read_csv(path, dtype=str)
+        except Exception as exc:
+            print(f"[ExternalEvidence] Failed to load {path}: {exc}")
+            return
+
+        for _, row in df.fillna("").iterrows():
+            evidence = self._row_to_evidence(row)
+            for key in self._candidate_keys(row):
+                if key:
+                    self.records[key] = evidence
+        self.enabled = bool(self.records)
+        if self.enabled:
+            print(f"[ExternalEvidence] Loaded {len(self.records)} lookup keys from {path}")
+
+    def lookup(self, row: pd.Series) -> dict:
+        if not self.enabled:
+            return self._empty()
+        for key in self._candidate_keys(row):
+            evidence = self.records.get(key)
+            if evidence:
+                return evidence
+        return self._empty()
+
+    @staticmethod
+    def _candidate_keys(row) -> list:
+        values = [
+            row.get("MDM_KEY", ""),
+            row.get("SRC_KEY", ""),
+            row.get("SOURCE_NAME", ""),
+            row.get("cleaned_name", ""),
+        ]
+        return [normalize_lookup_key(value) for value in values if str(value or "").strip()]
+
+    @staticmethod
+    def _row_to_evidence(row) -> dict:
+        text = first_nonempty(
+            row.get("evidence_text", ""),
+            row.get("evidence_summary", ""),
+            row.get("summary", ""),
+            row.get("snippet", ""),
+        )
+        url = first_nonempty(row.get("evidence_url", ""), row.get("url", ""), row.get("source_url", ""))
+        source = first_nonempty(row.get("evidence_source", ""), row.get("source", ""), "external_evidence_file")
+        return {
+            "external_evidence_available": bool(text or url),
+            "external_evidence_source": source,
+            "external_evidence_url": url,
+            "external_evidence_text": str(text)[:1000],
+        }
+
+    @staticmethod
+    def _empty() -> dict:
+        return {
+            "external_evidence_available": False,
+            "external_evidence_source": "",
+            "external_evidence_url": "",
+            "external_evidence_text": "",
+        }
+
+
+class WebSearchEvidenceClient:
+    """Optional Bing Web Search evidence source for company-address verification."""
+
+    def __init__(self):
+        enabled_flag = os.environ.get("ENABLE_WEB_SEARCH", "false").strip().lower()
+        self.enabled = enabled_flag in ("1", "true", "yes")
+        self.key = os.environ.get("BING_SEARCH_KEY", "")
+        self.endpoint = os.environ.get("BING_SEARCH_ENDPOINT", "https://api.bing.microsoft.com/v7.0/search")
+        self.max_calls = int(os.environ.get("WEB_SEARCH_MAX_CALLS", "0") or 0)
+        self.call_count = 0
+        self.error_count = 0
+        self.cache_hits = 0
+        self._cache = {}
+        self._cache_lock = asyncio.Lock()
+        if self.enabled and self.key:
+            print("[WebEvidence] Bing Web Search enabled")
+        elif self.enabled:
+            print("[WebEvidence] ENABLE_WEB_SEARCH is true but BING_SEARCH_KEY is missing")
+            self.enabled = False
+
+    async def search(self, row: pd.Series, verification: dict, session: aiohttp.ClientSession) -> dict:
+        if not self.enabled:
+            return ExternalEvidenceIndex._empty()
+        if self.max_calls and self.call_count >= self.max_calls:
+            return ExternalEvidenceIndex._empty()
+
+        query = self._query(row, verification)
+        if not query:
+            return ExternalEvidenceIndex._empty()
+
+        key = normalize_lookup_key(query)
+        async with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self.cache_hits += 1
+                return copy.deepcopy(cached)
+
+        evidence = await self._search_uncached(query, session)
+        async with self._cache_lock:
+            self._cache[key] = copy.deepcopy(evidence)
+        return evidence
+
+    async def _search_uncached(self, query: str, session: aiohttp.ClientSession) -> dict:
+        self.call_count += 1
+        try:
+            async with session.get(
+                self.endpoint,
+                params={"q": query, "count": 3, "responseFilter": "Webpages"},
+                headers={"Ocp-Apim-Subscription-Key": self.key},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    self.error_count += 1
+                    return ExternalEvidenceIndex._empty()
+                data = await resp.json()
+        except Exception:
+            self.error_count += 1
+            return ExternalEvidenceIndex._empty()
+
+        values = data.get("webPages", {}).get("value", []) if isinstance(data, dict) else []
+        snippets = []
+        urls = []
+        for item in values[:3]:
+            name = str(item.get("name", "")).strip()
+            snippet = str(item.get("snippet", "")).strip()
+            url = str(item.get("url", "")).strip()
+            if name or snippet:
+                snippets.append(f"{name}: {snippet}".strip(": "))
+            if url:
+                urls.append(url)
+
+        return {
+            "external_evidence_available": bool(snippets or urls),
+            "external_evidence_source": "bing_web_search" if snippets or urls else "",
+            "external_evidence_url": urls[0] if urls else "",
+            "external_evidence_text": " | ".join(snippets)[:1000],
+        }
+
+    @staticmethod
+    def _query(row: pd.Series, verification: dict) -> str:
+        company = first_nonempty(row.get("cleaned_name", ""), row.get("SOURCE_NAME", ""))
+        address = first_nonempty(row.get("validated_address", ""), row.get("api_address", ""))
+        candidate = first_nonempty(verification.get("matched_company_name", ""), verification.get("occupant_at_address", ""))
+        parts = [company, address]
+        if candidate and normalize_lookup_key(candidate) != normalize_lookup_key(company):
+            parts.append(candidate)
+        return " ".join(part for part in parts if part)
+
+
 class CompanyVerificationClient:
     """Azure Maps backed company/address verification client."""
 
@@ -586,12 +756,21 @@ class CompanyVerificationAdjudicator:
         else:
             print("[CompanyAdjudication] Disabled; using deterministic verification only")
 
-    async def adjudicate(self, row: pd.Series, verification: dict, session: aiohttp.ClientSession) -> dict:
+    async def adjudicate(
+        self,
+        row: pd.Series,
+        verification: dict,
+        session: aiohttp.ClientSession,
+        external_evidence: Optional[dict] = None,
+    ) -> dict:
         base = self._default_result(verification)
         status = verification.get("company_verification_status", "")
-        if not self.enabled or status not in self.PROMOTABLE_STATUSES:
+        has_external_evidence = bool((external_evidence or {}).get("external_evidence_available"))
+        if not self.enabled:
             return base
-        if not verification.get("matched_company_name") and not verification.get("occupant_at_address"):
+        if status not in self.PROMOTABLE_STATUSES and not (status == "UNVERIFIED" and has_external_evidence):
+            return base
+        if not verification.get("matched_company_name") and not verification.get("occupant_at_address") and not has_external_evidence:
             return base
 
         key = self._cache_key(row, verification)
@@ -601,12 +780,18 @@ class CompanyVerificationAdjudicator:
                 self.cache_hits += 1
                 return copy.deepcopy(cached)
 
-        result = await self._adjudicate_with_openai(row, verification, session)
+        result = await self._adjudicate_with_openai(row, verification, session, external_evidence or {})
         async with self._cache_lock:
             self._cache[key] = copy.deepcopy(result)
         return result
 
-    async def _adjudicate_with_openai(self, row: pd.Series, verification: dict, session: aiohttp.ClientSession) -> dict:
+    async def _adjudicate_with_openai(
+        self,
+        row: pd.Series,
+        verification: dict,
+        session: aiohttp.ClientSession,
+        external_evidence: dict,
+    ) -> dict:
         self.call_count += 1
         prompt = {
             "task": "Adjudicate whether the source company and Azure Maps candidate represent the same business at the validated address. Return JSON only.",
@@ -627,6 +812,12 @@ class CompanyVerificationAdjudicator:
             "azure_candidate_address": verification.get("matched_address", ""),
             "azure_candidate_category": verification.get("matched_category", ""),
             "azure_evidence": verification.get("verification_evidence", ""),
+            "external_web_evidence": {
+                "available": bool(external_evidence.get("external_evidence_available")),
+                "source": external_evidence.get("external_evidence_source", ""),
+                "url": external_evidence.get("external_evidence_url", ""),
+                "text": external_evidence.get("external_evidence_text", ""),
+            },
             "decision_rules": [
                 "Return VERIFIED only when source and candidate are clearly the same legal/brand entity at the validated address.",
                 "Return LIKELY_MATCH when names are alias/brand/location variants and address evidence is compatible.",
@@ -758,6 +949,8 @@ class Week3Pipeline:
             api_version=api_version,
             deployment=deployment,
         )
+        self.external_evidence = ExternalEvidenceIndex()
+        self.web_search = WebSearchEvidenceClient()
         self.batch_size = batch_size
 
     async def run(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -788,7 +981,10 @@ class Week3Pipeline:
             session=session,
         )
         deterministic_status = verification.get("company_verification_status", "UNVERIFIED")
-        adjudication = await self.adjudicator.adjudicate(row, verification, session)
+        external_evidence = self.external_evidence.lookup(row)
+        if not external_evidence.get("external_evidence_available"):
+            external_evidence = await self.web_search.search(row, verification, session)
+        adjudication = await self.adjudicator.adjudicate(row, verification, session, external_evidence)
         final_status = adjudication.get("final_company_verification_status", deterministic_status)
         final_verification = dict(verification)
         final_verification["company_verification_status"] = final_status
@@ -800,6 +996,7 @@ class Week3Pipeline:
         enrichment = await self.enricher.enrich(row, final_verification, session)
         result = {}
         result.update(verification)
+        result.update(external_evidence)
         result["deterministic_verification_status"] = deterministic_status
         result.update(adjudication)
         result["company_verification_status"] = final_status
@@ -821,7 +1018,9 @@ class Week3Pipeline:
             "ai_adjudication_method", "ai_promoted_match",
             "matched_company_name", "matched_address", "matched_latitude",
             "matched_longitude", "matched_category", "occupant_at_address",
-            "verification_method", "verification_evidence", "legal_name",
+            "verification_method", "verification_evidence",
+            "external_evidence_available", "external_evidence_source",
+            "external_evidence_url", "external_evidence_text", "legal_name",
             "enriched_full_address", "website", "email_domain", "naics_code",
             "sic_code", "parent_company", "domestic_ultimate",
             "global_ultimate", "headquarters_address", "employee_count",
@@ -928,6 +1127,22 @@ def generate_week3_report(df: pd.DataFrame, output_dir: str, pipeline: Week3Pipe
                 3,
             ),
         },
+        "evidence_sources": {
+            "azure_maps_poi_or_fuzzy": True,
+            "external_web_evidence_file": bool(pipeline.external_evidence.enabled),
+            "bing_web_search_runtime": bool(pipeline.web_search.enabled),
+            "external_web_evidence_records_used": int(
+                df["external_evidence_available"].fillna(False).astype(bool).sum()
+            ),
+            "external_web_evidence_file_path": pipeline.external_evidence.path or "",
+            "bing_web_search_calls": pipeline.web_search.call_count,
+            "bing_web_search_cache_hits": pipeline.web_search.cache_hits,
+            "bing_web_search_errors": pipeline.web_search.error_count,
+            "note": (
+                "Runtime verification uses Azure Maps POI/fuzzy search. Optional web evidence can come from "
+                "WEB_EVIDENCE_FILE or Bing Web Search when ENABLE_WEB_SEARCH=true and BING_SEARCH_KEY is configured."
+            ),
+        },
         "review_routing": {
             "distribution": df["review_routing"].value_counts(dropna=False).to_dict(),
             "targeted_review_total": int(df["review_routing"].fillna("").str.startswith("REVIEW_").sum()),
@@ -947,6 +1162,9 @@ def generate_week3_report(df: pd.DataFrame, output_dir: str, pipeline: Week3Pipe
             "openai_adjudication_cache_hits": pipeline.adjudicator.cache_hits,
             "openai_calls": pipeline.enricher.call_count,
             "openai_cache_hits": pipeline.enricher.cache_hits,
+            "bing_web_search_calls": pipeline.web_search.call_count,
+            "bing_web_search_cache_hits": pipeline.web_search.cache_hits,
+            "bing_web_search_errors": pipeline.web_search.error_count,
         },
     }
     report_path = Path(output_dir) / "week3_summary_report.json"
@@ -974,6 +1192,19 @@ def normalize_text(value: str) -> str:
     value = re.sub(r"[^a-z0-9\s]", " ", value)
     value = re.sub(r"\b(inc|llc|ltd|co|company|corp|corporation|gmbh|sa|srl|spa|plc)\b", " ", value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_lookup_key(value: str) -> str:
+    value = str(value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def first_nonempty(*values) -> str:
+    for value in values:
+        if str(value or "").strip():
+            return str(value).strip()
+    return ""
 
 
 def token_similarity(left: str, right: str) -> float:

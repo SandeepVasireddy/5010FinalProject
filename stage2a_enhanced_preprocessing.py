@@ -5,7 +5,7 @@ Week 2 Deliverable
 Builds on Stage 1 output to apply:
 1. Category-specific preprocessing rules per address_sub_category/name_sub_category
 2. Advanced street normalization (multilingual abbreviations, directionals, unit/suite)
-3. Multilingual handling: language detection → translation of non-Latin fields
+3. Multilingual handling: language detection, Unicode API strategy, and translation gap flags
 4. Address completeness scoring and flagging for records without callable addresses
 5. Country-code cross-validation (detect mismatches between address content and tagged country)
 """
@@ -14,6 +14,11 @@ import pandas as pd
 import numpy as np
 import re
 import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from typing import Optional
 
 # ──────────────────────────────────────────────
@@ -97,6 +102,86 @@ MX_STATE_ABBREVS = {
 ES_STATE_ABBREVS = {
     "GU": "Guadalajara", "M": "Madrid", "B": "Barcelona", "V": "Valencia",
 }
+
+
+class AzureTranslatorClient:
+    """Optional Azure Translator client for non-Latin address/name fields."""
+
+    def __init__(self):
+        enabled_flag = os.environ.get("ENABLE_TRANSLATION", "false").strip().lower()
+        self.enabled = enabled_flag in ("1", "true", "yes")
+        self.key = os.environ.get("AZURE_TRANSLATOR_KEY", "")
+        self.endpoint = os.environ.get("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com")
+        self.region = os.environ.get("AZURE_TRANSLATOR_REGION", "")
+        self.call_count = 0
+        self.error_count = 0
+        if self.enabled and self.key:
+            print("[Translator] Azure Translator enabled")
+        elif self.enabled:
+            print("[Translator] ENABLE_TRANSLATION is true but AZURE_TRANSLATOR_KEY is missing")
+            self.enabled = False
+
+    def translate_fields(self, fields: dict, from_lang: str) -> dict:
+        if not self.enabled:
+            return {
+                "translated_fields": {},
+                "translation_handling_status": "TRANSLATION_NOT_CONFIGURED",
+                "translation_gap_reason": "Azure Translator is not enabled/configured; Unicode source fields are retained.",
+            }
+
+        values = [str(value or "").strip() for value in fields.values()]
+        names = list(fields.keys())
+        nonempty = [(name, value) for name, value in zip(names, values) if value]
+        if not nonempty:
+            return {
+                "translated_fields": {},
+                "translation_handling_status": "TRANSLATION_SKIPPED_EMPTY_FIELDS",
+                "translation_gap_reason": "No non-empty fields were available for translation.",
+            }
+
+        route = "/translate?" + urllib.parse.urlencode({"api-version": "3.0", "to": "en"})
+        if from_lang and from_lang not in ("unknown", "nan"):
+            route += "&" + urllib.parse.urlencode({"from": from_lang})
+        request = urllib.request.Request(
+            self.endpoint.rstrip("/") + route,
+            data=json.dumps([{"text": value} for _, value in nonempty], ensure_ascii=False).encode("utf-8"),
+            headers=self._headers(),
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.call_count += 1
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+            self.error_count += 1
+            return {
+                "translated_fields": {},
+                "translation_handling_status": "TRANSLATION_ERROR",
+                "translation_gap_reason": f"Azure Translator failed; Unicode source fields retained. {str(exc)[:120]}",
+            }
+
+        translated = {}
+        for (name, _), item in zip(nonempty, payload):
+            translations = item.get("translations", []) if isinstance(item, dict) else []
+            if translations:
+                translated[name] = translations[0].get("text", "")
+
+        return {
+            "translated_fields": translated,
+            "translation_handling_status": "TRANSLATED_TO_ENGLISH",
+            "translation_gap_reason": "",
+        }
+
+    def _headers(self) -> dict:
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.key,
+            "Content-Type": "application/json",
+            "X-ClientTraceId": str(uuid.uuid4()),
+        }
+        if self.region:
+            headers["Ocp-Apim-Subscription-Region"] = self.region
+        return headers
 
 
 def expand_abbreviations(street: str, lang: str) -> tuple:
@@ -373,21 +458,31 @@ def prepare_for_api(street: str, city: str, state: str, country: str,
 
     api_address = ", ".join(parts)
 
-    # Determine if translation is needed
+    # Determine if translation/transliteration would be beneficial for downstream review.
+    # Azure Maps can accept Unicode queries, so the pipeline keeps the original address
+    # rather than guessing a lossy translation.
     needs_translation = lang in ("zh", "ja", "ko", "ru", "ar", "he", "th")
     api_strategy = "direct"  # default
+    translation_handling_status = "NOT_NEEDED_LATIN_SCRIPT"
+    translation_gap_reason = ""
 
     if needs_translation:
         if lang in ("zh", "ja", "ko"):
             # Submit CJK addresses as-is; Azure Maps can search Unicode address text.
             api_strategy = "direct_cjk"
+            translation_handling_status = "DIRECT_UNICODE_NO_TRANSLATION"
+            translation_gap_reason = "CJK record kept in Unicode for Azure Maps; full translation is not automated."
         else:
             api_strategy = "needs_transliteration"
+            translation_handling_status = "TRANSLITERATION_RECOMMENDED"
+            translation_gap_reason = "Non-Latin record flagged for transliteration/translation review; full translation is not automated."
 
     return {
         "api_address": api_address,
         "api_strategy": api_strategy,
         "needs_translation": needs_translation,
+        "translation_handling_status": translation_handling_status,
+        "translation_gap_reason": translation_gap_reason,
     }
 
 
@@ -406,6 +501,7 @@ def run_enhanced_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
     print("=" * 60)
 
     all_actions = []
+    translator = AzureTranslatorClient()
 
     for idx in df.index:
         row = df.loc[idx]
@@ -437,10 +533,45 @@ def run_enhanced_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
         # Store enhanced fields
         city = str(row.get("norm_city", row["parsed_city"]))
         name = str(row.get("cleaned_name", row["SOURCE_NAME"]))
+        needs_translation = lang in ("zh", "ja", "ko", "ru", "ar", "he", "th")
+
+        translated = {
+            "street": "",
+            "city": "",
+            "state": "",
+            "name": "",
+        }
+        translation_status_override = None
+        translation_reason_override = None
+        if needs_translation:
+            translated_result = translator.translate_fields(
+                {
+                    "street": expanded_street,
+                    "city": city,
+                    "state": expanded_state,
+                    "name": name,
+                },
+                lang,
+            )
+            translated.update(translated_result.get("translated_fields", {}))
+            translation_status_override = translated_result.get("translation_handling_status")
+            translation_reason_override = translated_result.get("translation_gap_reason")
+
+            expanded_street_for_api = translated.get("street") or expanded_street
+            city_for_api = translated.get("city") or city
+            state_for_api = translated.get("state") or expanded_state
+        else:
+            expanded_street_for_api = expanded_street
+            city_for_api = city
+            state_for_api = expanded_state
 
         df.at[idx, "enhanced_street"] = expanded_street
         df.at[idx, "enhanced_state"] = expanded_state
         df.at[idx, "enhanced_postal"] = norm_postal
+        df.at[idx, "translated_street"] = translated["street"]
+        df.at[idx, "translated_city"] = translated["city"]
+        df.at[idx, "translated_state"] = translated["state"]
+        df.at[idx, "translated_name"] = translated["name"]
 
         # 5. Country cross-validation
         cv = cross_validate_country(expanded_street, city, expanded_state, country, name, norm_postal)
@@ -455,10 +586,17 @@ def run_enhanced_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
         df.at[idx, "completeness_class"] = cs["completeness_class"]
 
         # 7. API preparation
-        ap = prepare_for_api(expanded_street, city, expanded_state,
+        ap = prepare_for_api(expanded_street_for_api, city_for_api, state_for_api,
                              api_country, norm_postal, name, lang)
+        if translation_status_override:
+            ap["translation_handling_status"] = translation_status_override
+        if translation_reason_override is not None:
+            ap["translation_gap_reason"] = translation_reason_override
         df.at[idx, "api_address"] = ap["api_address"]
         df.at[idx, "api_strategy"] = ap["api_strategy"]
+        df.at[idx, "needs_translation"] = ap["needs_translation"]
+        df.at[idx, "translation_handling_status"] = ap["translation_handling_status"]
+        df.at[idx, "translation_gap_reason"] = ap["translation_gap_reason"]
 
         # Store preprocessing actions
         df.at[idx, "enhanced_preprocessing_actions"] = json.dumps(actions)
@@ -478,6 +616,13 @@ def run_enhanced_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
     for strat in df["api_strategy"].unique():
         count = (df["api_strategy"] == strat).sum()
         print(f"    {strat}: {count}")
+
+    print(f"  Translation handling distribution:")
+    for status in df["translation_handling_status"].fillna("UNKNOWN").unique():
+        count = (df["translation_handling_status"] == status).sum()
+        print(f"    {status}: {count}")
+    print(f"  Azure Translator calls: {translator.call_count}")
+    print(f"  Azure Translator errors: {translator.error_count}")
 
     return df
 

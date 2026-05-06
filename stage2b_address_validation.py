@@ -906,6 +906,21 @@ def generate_validation_report(df: pd.DataFrame, output_dir: str) -> dict:
         }
     report["completeness_breakdown"] = comp_stats
 
+    if "translation_handling_status" in df.columns:
+        needs_translation = df.get("needs_translation", pd.Series(False, index=df.index))
+        api_strategy = df.get("api_strategy", pd.Series("UNKNOWN", index=df.index))
+        needs_translation_mask = needs_translation.fillna(False).astype(str).str.lower().isin(["true", "1", "yes"])
+        report["translation_handling"] = {
+            "distribution": df["translation_handling_status"].fillna("UNKNOWN").value_counts().to_dict(),
+            "needs_translation_total": int(needs_translation_mask.sum()),
+            "api_strategy_distribution": api_strategy.fillna("UNKNOWN").value_counts().to_dict(),
+            "note": (
+                "Non-Latin records are measured and routed with an explicit handling status. "
+                "The pipeline keeps Unicode addresses for Azure Maps and flags records where "
+                "translation/transliteration remains a review gap."
+            ),
+        }
+
     # Failure analysis
     failed = df[df["validation_status"] == "FAILED"]
     report["failure_analysis"] = {
