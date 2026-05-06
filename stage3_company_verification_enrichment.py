@@ -10,6 +10,7 @@ This module starts from Stage 2B usable validated records and adds:
 
 import argparse
 import asyncio
+import ast
 import copy
 import hashlib
 import json
@@ -556,22 +557,206 @@ class FirmographicEnrichmentClient:
         return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
+class CompanyVerificationAdjudicator:
+    """Use Azure OpenAI to adjudicate borderline company/address candidates."""
+
+    PROMOTABLE_STATUSES = {"ADDRESS_MISMATCH", "CORRECT_ADDRESS_CANDIDATE"}
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        api_url: Optional[str] = None,
+        api_version: Optional[str] = None,
+        deployment: Optional[str] = None,
+        promotion_threshold: float = 0.75,
+    ):
+        self.api_key = api_key
+        self.api_url = normalize_openai_url(api_url)
+        self.api_version = api_version or "2024-06-01"
+        self.deployment = deployment or "gpt-4.1-mini"
+        self.chat_url = build_chat_completion_url(self.api_url, self.deployment, self.api_version)
+        self.enabled = bool(api_key and self.chat_url)
+        self.promotion_threshold = promotion_threshold
+        self.call_count = 0
+        self.cache_hits = 0
+        self._cache = {}
+        self._cache_lock = asyncio.Lock()
+        if self.enabled:
+            print("[CompanyAdjudication] Azure OpenAI adjudication enabled")
+        else:
+            print("[CompanyAdjudication] Disabled; using deterministic verification only")
+
+    async def adjudicate(self, row: pd.Series, verification: dict, session: aiohttp.ClientSession) -> dict:
+        base = self._default_result(verification)
+        status = verification.get("company_verification_status", "")
+        if not self.enabled or status not in self.PROMOTABLE_STATUSES:
+            return base
+        if not verification.get("matched_company_name") and not verification.get("occupant_at_address"):
+            return base
+
+        key = self._cache_key(row, verification)
+        async with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self.cache_hits += 1
+                return copy.deepcopy(cached)
+
+        result = await self._adjudicate_with_openai(row, verification, session)
+        async with self._cache_lock:
+            self._cache[key] = copy.deepcopy(result)
+        return result
+
+    async def _adjudicate_with_openai(self, row: pd.Series, verification: dict, session: aiohttp.ClientSession) -> dict:
+        self.call_count += 1
+        prompt = {
+            "task": "Adjudicate whether the source company and Azure Maps candidate represent the same business at the validated address. Return JSON only.",
+            "allowed_decisions": [
+                "VERIFIED",
+                "LIKELY_MATCH",
+                "ADDRESS_MISMATCH",
+                "CORRECT_ADDRESS_CANDIDATE",
+                "UNVERIFIED",
+            ],
+            "source_company": row.get("cleaned_name") or row.get("SOURCE_NAME", ""),
+            "source_raw_name": row.get("SOURCE_NAME", ""),
+            "validated_address": row.get("validated_address", ""),
+            "country": row.get("norm_country", ""),
+            "deterministic_status": verification.get("company_verification_status", ""),
+            "deterministic_confidence": verification.get("verification_confidence", 0.0),
+            "azure_candidate_name": verification.get("matched_company_name", ""),
+            "azure_candidate_address": verification.get("matched_address", ""),
+            "azure_candidate_category": verification.get("matched_category", ""),
+            "azure_evidence": verification.get("verification_evidence", ""),
+            "decision_rules": [
+                "Return VERIFIED only when source and candidate are clearly the same legal/brand entity at the validated address.",
+                "Return LIKELY_MATCH when names are alias/brand/location variants and address evidence is compatible.",
+                "Return ADDRESS_MISMATCH when the address appears occupied by a different unrelated organization.",
+                "Return CORRECT_ADDRESS_CANDIDATE when the company seems real but candidate address differs from the validated address.",
+                "Return UNVERIFIED when evidence is too weak.",
+            ],
+            "required_json_fields": ["decision", "confidence", "reason"],
+        }
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a cautious MDM company-address verification adjudicator. "
+                        "Prefer precision over recall. Return one compact JSON object only."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
+            "temperature": 0,
+        }
+
+        try:
+            async with session.post(
+                self.chat_url,
+                headers=openai_headers(self.chat_url, self.api_key),
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    result = self._default_result(verification)
+                    result["ai_adjudication_reason"] = f"OpenAI adjudication failed: HTTP {resp.status}: {text[:120]}"
+                    return result
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = None
+        except Exception as exc:
+            result = self._default_result(verification)
+            result["ai_adjudication_reason"] = f"OpenAI adjudication failed: {str(exc)[:120]}"
+            return result
+
+        content = FirmographicEnrichmentClient._extract_openai_content(data)
+        parsed = safe_json_loads(content)
+        if not parsed:
+            result = self._default_result(verification)
+            result["ai_adjudication_reason"] = "OpenAI adjudication returned non-JSON content"
+            return result
+
+        decision = str(parsed.get("decision", "")).strip().upper()
+        if decision not in {"VERIFIED", "LIKELY_MATCH", "ADDRESS_MISMATCH", "CORRECT_ADDRESS_CANDIDATE", "UNVERIFIED"}:
+            decision = verification.get("company_verification_status", "UNVERIFIED")
+        confidence = clamp_float(parsed.get("confidence", 0.0))
+        reason = str(parsed.get("reason", "")).strip()[:500]
+        promoted = decision in {"VERIFIED", "LIKELY_MATCH"} and confidence >= self.promotion_threshold
+
+        final_status = decision if promoted else verification.get("company_verification_status", "UNVERIFIED")
+        return {
+            "ai_adjudication_status": decision,
+            "ai_adjudication_confidence": confidence,
+            "ai_adjudication_reason": reason,
+            "ai_adjudication_method": "azure_openai_candidate_adjudication",
+            "ai_promoted_match": promoted,
+            "final_company_verification_status": final_status,
+            "overall_confidence_score": self._overall_confidence(verification, decision, confidence, promoted),
+        }
+
+    def _default_result(self, verification: dict) -> dict:
+        status = verification.get("company_verification_status", "UNVERIFIED")
+        confidence = clamp_float(verification.get("verification_confidence", 0.0))
+        return {
+            "ai_adjudication_status": "NOT_RUN",
+            "ai_adjudication_confidence": 0.0,
+            "ai_adjudication_reason": "",
+            "ai_adjudication_method": "",
+            "ai_promoted_match": False,
+            "final_company_verification_status": status,
+            "overall_confidence_score": confidence,
+        }
+
+    @staticmethod
+    def _overall_confidence(verification: dict, decision: str, ai_confidence: float, promoted: bool) -> float:
+        deterministic = clamp_float(verification.get("verification_confidence", 0.0))
+        if promoted:
+            return round((0.45 * deterministic) + (0.55 * ai_confidence), 3)
+        if decision in {"ADDRESS_MISMATCH", "CORRECT_ADDRESS_CANDIDATE", "UNVERIFIED"}:
+            return round(max(deterministic, ai_confidence), 3)
+        return deterministic
+
+    @staticmethod
+    def _cache_key(row: pd.Series, verification: dict) -> str:
+        raw = "|".join([
+            str(row.get("MDM_KEY", "")),
+            str(row.get("SOURCE_NAME", "")),
+            str(row.get("validated_address", "")),
+            str(verification.get("matched_company_name", "")),
+            str(verification.get("matched_address", "")),
+        ])
+        return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
 class Week3Pipeline:
     """Company verification and enrichment orchestration."""
 
     def __init__(self, azure_key: Optional[str], openai_key: Optional[str], openai_url: Optional[str], batch_size: int = 10):
+        local_openai = load_test1_azure_openai_config()
+        api_version = (
+            os.environ.get("AZURE_OPENAI_API_VERSION")
+            or os.environ.get("OPENAI_API_VERSION")
+            or local_openai.get("api_version")
+        )
+        deployment = (
+            os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+            or os.environ.get("OPENAI_MODEL")
+            or local_openai.get("model")
+        )
         self.verifier = CompanyVerificationClient(azure_key=azure_key)
+        self.adjudicator = CompanyVerificationAdjudicator(
+            api_key=openai_key,
+            api_url=openai_url,
+            api_version=api_version,
+            deployment=deployment,
+        )
         self.enricher = FirmographicEnrichmentClient(
             api_key=openai_key,
             api_url=openai_url,
-            api_version=(
-                os.environ.get("AZURE_OPENAI_API_VERSION")
-                or os.environ.get("OPENAI_API_VERSION")
-            ),
-            deployment=(
-                os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-                or os.environ.get("OPENAI_MODEL")
-            ),
+            api_version=api_version,
+            deployment=deployment,
         )
         self.batch_size = batch_size
 
@@ -602,11 +787,27 @@ class Week3Pipeline:
             longitude=row.get("longitude"),
             session=session,
         )
-        enrichment = await self.enricher.enrich(row, verification, session)
+        deterministic_status = verification.get("company_verification_status", "UNVERIFIED")
+        adjudication = await self.adjudicator.adjudicate(row, verification, session)
+        final_status = adjudication.get("final_company_verification_status", deterministic_status)
+        final_verification = dict(verification)
+        final_verification["company_verification_status"] = final_status
+        final_verification["verification_confidence"] = adjudication.get(
+            "overall_confidence_score",
+            verification.get("verification_confidence", 0.0),
+        )
+
+        enrichment = await self.enricher.enrich(row, final_verification, session)
         result = {}
         result.update(verification)
+        result["deterministic_verification_status"] = deterministic_status
+        result.update(adjudication)
+        result["company_verification_status"] = final_status
+        result["verification_confidence"] = final_verification["verification_confidence"]
         result.update(enrichment)
-        result["week3_manual_review_flag"] = result["company_verification_status"] not in ("VERIFIED", "LIKELY_MATCH")
+        route = route_week3_record(result)
+        result.update(route)
+        result["week3_manual_review_flag"] = result["review_routing"].startswith("REVIEW_")
         result["stage3_timestamp"] = datetime.now().isoformat()
         return idx, result
 
@@ -614,6 +815,10 @@ class Week3Pipeline:
     def _initialize_columns(df: pd.DataFrame):
         columns = [
             "company_verification_status", "verification_confidence",
+            "deterministic_verification_status", "final_company_verification_status",
+            "overall_confidence_score", "ai_adjudication_status",
+            "ai_adjudication_confidence", "ai_adjudication_reason",
+            "ai_adjudication_method", "ai_promoted_match",
             "matched_company_name", "matched_address", "matched_latitude",
             "matched_longitude", "matched_category", "occupant_at_address",
             "verification_method", "verification_evidence", "legal_name",
@@ -621,7 +826,8 @@ class Week3Pipeline:
             "sic_code", "parent_company", "domestic_ultimate",
             "global_ultimate", "headquarters_address", "employee_count",
             "revenue_range", "year_established", "enrichment_method",
-            "enrichment_notes", "week3_manual_review_flag", "stage3_timestamp",
+            "enrichment_notes", "review_routing", "review_priority",
+            "review_reason", "week3_manual_review_flag", "stage3_timestamp",
         ]
         for column in columns:
             if column not in df.columns:
@@ -632,6 +838,7 @@ def run_week3(input_csv: str, output_dir: str = "output_week3", limit: Optional[
     """Run Week 3 company verification and enrichment."""
     load_dotenv()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    local_openai = load_test1_azure_openai_config()
 
     df = pd.read_csv(input_csv, low_memory=False)
     if limit:
@@ -650,10 +857,12 @@ def run_week3(input_csv: str, output_dir: str = "output_week3", limit: Optional[
         azure_key=os.environ.get("AZURE_MAPS_KEY"),
         openai_key=(
             os.environ.get("AZURE_OPENAI_API_KEY")
+            or local_openai.get("api_key")
             or os.environ.get("OPENAI_API_KEY")
         ),
         openai_url=(
             os.environ.get("AZURE_OPENAI_API_BASE")
+            or local_openai.get("api_base")
             or os.environ.get("OPENAI_URL")
         ),
     )
@@ -672,6 +881,17 @@ def run_week3(input_csv: str, output_dir: str = "output_week3", limit: Optional[
     manual_path = Path(output_dir) / "stage3_manual_review.csv"
     manual.to_csv(manual_path, index=False)
     print(f"[Output] Week 3 manual review records saved to {manual_path}")
+
+    action_files = {
+        "stage3_auto_enriched.csv": enriched[enriched["review_routing"] == "AUTO_ENRICH"],
+        "stage3_auto_no_enrich.csv": enriched[enriched["review_routing"] == "AUTO_NO_ENRICH_ADDRESS_MISMATCH"],
+        "stage3_targeted_review.csv": enriched[enriched["review_routing"].fillna("").str.startswith("REVIEW_")],
+        "stage3_deferred_no_evidence.csv": enriched[enriched["review_routing"] == "DEFER_NO_EVIDENCE"],
+    }
+    for filename, subset in action_files.items():
+        path = Path(output_dir) / filename
+        subset.to_csv(path, index=False)
+        print(f"[Output] {filename}: {len(subset)} records")
 
     report = generate_week3_report(enriched, output_dir, pipeline)
     print_summary(report)
@@ -700,13 +920,31 @@ def generate_week3_report(df: pd.DataFrame, output_dir: str, pipeline: Week3Pipe
         },
         "enrichment_method_distribution": df["enrichment_method"].value_counts(dropna=False).to_dict(),
         "enrichment_field_coverage": field_coverage,
+        "ai_adjudication": {
+            "distribution": df["ai_adjudication_status"].value_counts(dropna=False).to_dict(),
+            "promoted_matches": int((df["ai_promoted_match"] == True).sum()),
+            "average_overall_confidence": round(
+                df["overall_confidence_score"].fillna(0).astype(float).mean(),
+                3,
+            ),
+        },
+        "review_routing": {
+            "distribution": df["review_routing"].value_counts(dropna=False).to_dict(),
+            "targeted_review_total": int(df["review_routing"].fillna("").str.startswith("REVIEW_").sum()),
+            "auto_enrich_total": int((df["review_routing"] == "AUTO_ENRICH").sum()),
+            "auto_no_enrich_total": int((df["review_routing"] == "AUTO_NO_ENRICH_ADDRESS_MISMATCH").sum()),
+            "deferred_no_evidence_total": int((df["review_routing"] == "DEFER_NO_EVIDENCE").sum()),
+        },
         "manual_review": {
             "total": int((df["week3_manual_review_flag"] == True).sum()),
             "by_status": df[df["week3_manual_review_flag"] == True]["company_verification_status"].value_counts().to_dict(),
+            "by_priority": df[df["week3_manual_review_flag"] == True]["review_priority"].value_counts().to_dict(),
         },
         "api_usage": {
             "azure_maps_calls": pipeline.verifier.call_count,
             "azure_maps_cache_hits": pipeline.verifier.cache_hits,
+            "openai_adjudication_calls": pipeline.adjudicator.call_count,
+            "openai_adjudication_cache_hits": pipeline.adjudicator.cache_hits,
             "openai_calls": pipeline.enricher.call_count,
             "openai_cache_hits": pipeline.enricher.cache_hits,
         },
@@ -765,6 +1003,62 @@ def is_generic_place_name(name: str) -> bool:
     return normalized in generic or len(normalized) <= 2
 
 
+def route_week3_record(result: dict) -> dict:
+    status = result.get("company_verification_status", "UNVERIFIED")
+    confidence = clamp_float(result.get("overall_confidence_score", result.get("verification_confidence", 0.0)))
+
+    if status in ("VERIFIED", "LIKELY_MATCH"):
+        return {
+            "review_routing": "AUTO_ENRICH",
+            "review_priority": "NONE",
+            "review_reason": "Trusted company-address match; record eligible for firmographic enrichment.",
+        }
+
+    if status == "ADDRESS_MISMATCH" and confidence >= 0.75:
+        return {
+            "review_routing": "AUTO_NO_ENRICH_ADDRESS_MISMATCH",
+            "review_priority": "NONE",
+            "review_reason": "High-confidence evidence indicates a different occupant/entity at the validated address.",
+        }
+
+    if status == "ADDRESS_MISMATCH":
+        return {
+            "review_routing": "REVIEW_LOW_CONFIDENCE_MISMATCH",
+            "review_priority": "MEDIUM",
+            "review_reason": "Address mismatch evidence exists but confidence is below the automatic no-enrich threshold.",
+        }
+
+    if status == "CORRECT_ADDRESS_CANDIDATE":
+        return {
+            "review_routing": "REVIEW_CORRECT_ADDRESS_CANDIDATE",
+            "review_priority": "HIGH",
+            "review_reason": "Company candidate was found at a different address; review for possible source address correction.",
+        }
+
+    if status == "API_ERROR":
+        return {
+            "review_routing": "REVIEW_API_ERROR",
+            "review_priority": "MEDIUM",
+            "review_reason": "Verification failed due to API error; retry or inspect service response.",
+        }
+
+    return {
+        "review_routing": "DEFER_NO_EVIDENCE",
+        "review_priority": "LOW",
+        "review_reason": "No reliable company/address candidate was found; needs additional source coverage before human review.",
+    }
+
+
+def clamp_float(value, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return minimum
+    if number > 1 and maximum == 1.0:
+        number = number / 100
+    return round(max(minimum, min(maximum, number)), 3)
+
+
 def normalize_openai_url(api_url: Optional[str]) -> Optional[str]:
     if not api_url:
         return None
@@ -791,11 +1085,58 @@ def build_chat_completion_url(api_url: Optional[str], deployment: str, api_versi
 
 def openai_headers(api_url: str, api_key: str) -> dict:
     headers = {"Content-Type": "application/json"}
-    if os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_BASE"):
+    lowered_url = (api_url or "").lower()
+    is_azure_openai = (
+        "openai.azure.com" in lowered_url
+        or "/openai/deployments/" in lowered_url
+        or os.environ.get("AZURE_OPENAI_API_KEY")
+        or os.environ.get("AZURE_OPENAI_API_BASE")
+    )
+    if is_azure_openai:
         headers["api-key"] = api_key
     else:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
+
+
+def load_test1_azure_openai_config() -> dict:
+    """Read local Azure OpenAI defaults from test1.py without executing it."""
+    path = Path("test1.py")
+    if not path.exists():
+        return {}
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    mapping = {
+        "API_KEY": "api_key",
+        "API_BASE": "api_base",
+        "API_VERSION": "api_version",
+        "MODEL": "model",
+    }
+    values = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        value = literal_or_getenv_default(node.value)
+        if not value:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in mapping:
+                values[mapping[target.id]] = value
+    return values
+
+
+def literal_or_getenv_default(node) -> Optional[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if node.func.attr == "getenv" and len(node.args) >= 2:
+            default = node.args[1]
+            if isinstance(default, ast.Constant) and isinstance(default.value, str):
+                return default.value
+    return None
 
 
 def fuzzy_url_from_poi_url(poi_url: Optional[str]) -> Optional[str]:
